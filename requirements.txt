@@ -1,0 +1,8 @@
+torch==2.11.0
+torchaudio==2.11.0
+torchvision==0.26.0
+onnxscript==0.7.0
+mir_eval==0.8.2
+musdb==0.4.3
+stempeg==0.2.6
+numpy==1.26.3
