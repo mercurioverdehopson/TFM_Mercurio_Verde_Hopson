@@ -29,12 +29,14 @@ def export_and_quantize(model, fp32_filepath="tiny_unet_musdb.onnx", int8_filepa
     
     # 1. Exportación a ONNX estándar (FP32)
     logging.info("Fase 1: Exportando modelo base a formato ONNX (FP32)...")
-    dummy_input = torch.randn(1, 1, 512, 352, device=device) # Ajustado a los 352 frames de la metodologia
+    # Mover a CPU para asegurar un export a ONNX y cuantización estables
+    model = model.cpu()
+    dummy_input = torch.randn(1, 1, 512, 352, device="cpu") # Ajustado a los 352 frames de la metodologia
     
     try:
         torch.onnx.export(
             model, dummy_input, fp32_filepath,
-            export_params=True, opset_version=18, do_constant_folding=True,
+            export_params=True, opset_version=14, do_constant_folding=True,
             input_names=['mix_spectrogram'], output_names=['stem_masks'],
             dynamic_axes={
                 'mix_spectrogram': {0: 'batch_size', 3: 'time_frames'},

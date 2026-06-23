@@ -63,7 +63,7 @@ if __name__ == "__main__":
         train_dataloader=train_loader, 
         val_dataloader=val_loader, 
         device=device, 
-        epochs=1,       # Ajustado al estándar, el Early Stopping lo detendrá si es necesario
+        epochs=50,      # Entrenamiento completo. Early Stopping lo detendrá si es necesario
         patience=5
     )
     
