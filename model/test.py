@@ -58,8 +58,8 @@ def test_model(model, test_loader, device):
     # Desactivamos el cálculo de gradientes para ahorrar memoria y CPU
     with torch.no_grad():
         for batch_idx, (mix, true_stems, mix_phase, true_audio) in enumerate(test_loader):
-            mix = mix.to(device)
-            true_stems = true_stems.to(device)
+            mix = mix.to(device, non_blocking=True)
+            true_stems = true_stems.to(device, non_blocking=True)
             
             # 1. Predicción
             masks = model(mix)

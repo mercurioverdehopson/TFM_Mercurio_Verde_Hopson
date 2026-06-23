@@ -43,15 +43,7 @@ class MUSDB18RandomMixDataset(Dataset):
             gain = random.uniform(0.5, 1.5)
             resampled_audio = resampled_audio * gain
             
-            # b) Desplazamiento de Tono (Pitch Shifting): +/- 2 semitonos
-            # Se aplica con un 50% de probabilidad para no sobrecargar el procesamiento
-            if random.random() < 0.5:
-                n_steps = random.randint(-2, 2)
-                resampled_audio = torchaudio.functional.pitch_shift(
-                    resampled_audio, 
-                    self.target_sr, 
-                    n_steps
-                )
+            # b) Desplazamiento de Tono (Pitch Shifting) ELIMINADO para mejorar rendimiento de CPU.
         # ---------------------------------------------------
         
         # 2. STFT (Tensor complejo)
@@ -72,11 +64,12 @@ class MUSDB18RandomMixDataset(Dataset):
         return complex_spec, resampled_audio
 
     def __getitem__(self, idx):
-        stems_complex = []
-        stems_audio = []
+        # Pre-alocar tensores para evitar fragmentación de memoria
+        stems_complex = torch.empty(4, 512, self.time_frames, dtype=torch.cfloat)
+        stems_audio = torch.empty(4, self.time_frames * self.hop_length)
         
         # 1. Extraer fragmentos aleatorios
-        for inst in self.instruments:
+        for i, inst in enumerate(self.instruments):
             track = random.choice(self.mus.tracks)
             max_start = max(0, track.duration - self.chunk_duration)
             start_time = random.uniform(0, max_start)
@@ -85,13 +78,13 @@ class MUSDB18RandomMixDataset(Dataset):
             track.chunk_duration = self.chunk_duration
             
             complex_spec, audio_wave = self._process_audio(track.targets[inst].audio)
-            stems_complex.append(complex_spec)
-            stems_audio.append(audio_wave)
+            stems_complex[i] = complex_spec[0]
+            stems_audio[i] = audio_wave[0]
             
         # 2. Agrupar stems
-        # Ahora el shape resultante será (4, 512, 352) debido a los nuevos time_frames
-        complex_stems_tensor = torch.cat(stems_complex, dim=0) 
-        true_audio = torch.cat(stems_audio, dim=0)             
+        # Shape resultante: (4, 512, 352)
+        complex_stems_tensor = stems_complex
+        true_audio = stems_audio
         
         # 3. Crear la mezcla "Frankenstein"
         complex_mix = torch.sum(complex_stems_tensor, dim=0, keepdim=True) 

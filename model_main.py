@@ -5,7 +5,7 @@ import os
 import datetime
 
 # Importaciones adaptadas a las nuevas funciones y arquitecturas
-from model.train import train_model
+from model.train import train_model, finetune_model
 from model.export import export_and_quantize
 from model.test import test_model
 from model.pruning import apply_structural_pruning
@@ -43,9 +43,17 @@ if __name__ == "__main__":
     # Test: Evaluación final estricta
     dataset_test = MUSDB18RandomMixDataset(root_dir=ruta_dataset, split='test', samples_per_epoch=100)
     
-    train_loader = DataLoader(dataset_train, batch_size=16, shuffle=True, num_workers=0)
-    val_loader   = DataLoader(dataset_val, batch_size=16, shuffle=False, num_workers=0)
-    test_loader  = DataLoader(dataset_test, batch_size=4, shuffle=False, num_workers=0)
+    # Configuración óptima para RunPod con GPU: workers paralelos + pin_memory
+    loader_kwargs = {
+        'num_workers': 4,           # 4 procesos paralelos para precargar datos
+        'pin_memory': True,         # Memoria fija para transferencia rápida CPU→GPU
+        'persistent_workers': True, # Reusar procesos entre epochs (evita fork overhead)
+        'prefetch_factor': 2,       # Pre-cargar 2 batches por worker
+    }
+    
+    train_loader = DataLoader(dataset_train, batch_size=16, shuffle=True, **loader_kwargs)
+    val_loader   = DataLoader(dataset_val, batch_size=16, shuffle=False, **loader_kwargs)
+    test_loader  = DataLoader(dataset_test, batch_size=4, shuffle=False, **loader_kwargs)
 
     # ==========================================
     # 2. ENTRENAMIENTO (Con Early Stopping)
@@ -60,23 +68,38 @@ if __name__ == "__main__":
     )
     
     # ==========================================
-    # 3. COMPRESIÓN: PODA ESTRUCTURAL
+    # 3. COMPRESIÓN: PODA ESTRUCTURAL (10%)
     # ==========================================
-    logging.info("--- Fase 2: Poda Estructural ---")
-    pruned_model = apply_structural_pruning(trained_model, pruning_amount=0.2)
+    logging.info("--- Fase 2: Poda Estructural (10%) ---")
+    pruned_model = apply_structural_pruning(trained_model, pruning_amount=0.1)
     
     # ==========================================
-    # 4. EVALUACIÓN (Métricas BSS EVAL)
+    # 4. FINE-TUNING POST-PODA
     # ==========================================
-    # IMPORTANTE: Evaluamos el modelo DESPUÉS de la poda para obtener 
+    # Reajustar los pesos tras la poda con un LR reducido (0.0001)
+    # para que el modelo recupere la calidad perdida al eliminar canales.
+    logging.info("--- Fase 3: Fine-Tuning post-poda ---")
+    finetuned_model = finetune_model(
+        model=pruned_model,
+        train_dataloader=train_loader,
+        val_dataloader=val_loader,
+        device=device,
+        epochs=10,
+        patience=3
+    )
+    
+    # ==========================================
+    # 5. EVALUACIÓN (Métricas BSS EVAL)
+    # ==========================================
+    # IMPORTANTE: Evaluamos el modelo DESPUÉS del fine-tuning para obtener 
     # las métricas reales que tendrá el modelo ligero en producción.
-    logging.info("--- Fase 3: Evaluacion BSS EVAL ---")
-    test_model(pruned_model, test_loader, device=device)
+    logging.info("--- Fase 4: Evaluacion BSS EVAL ---")
+    test_model(finetuned_model, test_loader, device=device)
     
     # ==========================================
-    # 5. EXPORTACIÓN Y CUANTIZACIÓN INT8
+    # 6. EXPORTACIÓN Y CUANTIZACIÓN INT8
     # ==========================================
-    logging.info("--- Fase 4: Exportacion y Cuantizacion INT8 ---")
-    export_and_quantize(pruned_model, device=device)
+    logging.info("--- Fase 5: Exportacion y Cuantizacion INT8 ---")
+    export_and_quantize(finetuned_model, device=device)
     
     logging.info("Pipeline principal ejecutado con exito.")

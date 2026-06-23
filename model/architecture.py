@@ -2,21 +2,51 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation block for channel attention"""
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, max(1, channels // reduction), bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(max(1, channels // reduction), channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
 class DoubleConv(nn.Module):
-    """Bloque básico de convolución para el Encoder y Decoder"""
+    """Bloque básico de convolución para el Encoder y Decoder con SE y Residual"""
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.BatchNorm2d(out_channels)
         )
+        self.se = SEBlock(out_channels)
+        
+        self.residual = nn.Sequential()
+        if in_channels != out_channels:
+            self.residual = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1),
+                nn.BatchNorm2d(out_channels)
+            )
+        self.final_relu = nn.LeakyReLU(0.1, inplace=True)
 
     def forward(self, x):
-        return self.conv(x)
+        res = self.residual(x)
+        out = self.conv(x)
+        out = self.se(out)
+        out += res
+        return self.final_relu(out)
 
 class TinyUNetMultiStem(nn.Module):
     def __init__(self):
@@ -34,6 +64,7 @@ class TinyUNetMultiStem(nn.Module):
         
         # Cuello de Botella
         self.bottleneck = DoubleConv(128, 256)
+        self.dropout = nn.Dropout2d(0.15)
         
         # Decoder (Expansión)
         self.upconv4 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
@@ -54,12 +85,13 @@ class TinyUNetMultiStem(nn.Module):
     def forward(self, x):
         # Encoder
         e1 = self.enc1(x)
-        e2 = self.enc2(self.pool1(e1))
-        e3 = self.enc3(self.pool2(e2))
-        e4 = self.enc4(self.pool3(e3))
+        e2 = self.enc2(self.pool1(e1))                    # Sin dropout en capas tempranas
+        e3 = self.enc3(self.dropout(self.pool2(e2)))       # Dropout solo desde enc3
+        e4 = self.enc4(self.dropout(self.pool3(e3)))
         
         # Bottleneck
-        b = self.bottleneck(self.pool4(e4))
+        b = self.bottleneck(self.dropout(self.pool4(e4)))
+        b = self.dropout(b)
         
         # Decoder con Skip Connections
         d4 = self.upconv4(b)
