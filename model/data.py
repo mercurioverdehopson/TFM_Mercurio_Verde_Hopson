@@ -7,7 +7,7 @@ import random
 
 class MUSDB18RandomMixDataset(Dataset):
     def __init__(self, root_dir, split='train', samples_per_epoch=2000):
-        self.mus = musdb.DB(root=root_dir, subsets=split, is_wav=False)
+        self.mus = musdb.DB(root=root_dir, subsets=split, is_wav=True)
         self.split = split  # NUEVO: Guardamos la fase para saber cuándo aplicar augmentations
         self.samples_per_epoch = samples_per_epoch
         self.instruments = ['vocals', 'drums', 'bass', 'other']
