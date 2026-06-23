@@ -51,9 +51,9 @@ if __name__ == "__main__":
         'prefetch_factor': 2,       # Pre-cargar 2 batches por worker
     }
     
-    train_loader = DataLoader(dataset_train, batch_size=16, shuffle=True, **loader_kwargs)
-    val_loader   = DataLoader(dataset_val, batch_size=16, shuffle=False, **loader_kwargs)
-    test_loader  = DataLoader(dataset_test, batch_size=4, shuffle=False, **loader_kwargs)
+    train_loader = DataLoader(dataset_train, batch_size=64, shuffle=True, **loader_kwargs)
+    val_loader   = DataLoader(dataset_val, batch_size=64, shuffle=False, **loader_kwargs)
+    test_loader  = DataLoader(dataset_test, batch_size=16, shuffle=False, **loader_kwargs)
 
     # ==========================================
     # 2. ENTRENAMIENTO (Con Early Stopping)
