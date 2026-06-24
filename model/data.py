@@ -17,10 +17,10 @@ class MUSDB18RandomMixDataset(Dataset):
         self.n_fft = 1024
         self.hop_length = 256
         
-        # NUEVO: Segmentación adaptada a ~4 segundos (352 frames).
-        # 352 es múltiplo de 16, necesario para que los 4 MaxPool2d de tu Tiny U-Net funcionen.
-        # (352 * 256) / 22050 = 4.08 segundos.
-        self.time_frames = 352 
+        # Segmentación adaptada a ~6 segundos (528 frames).
+        # 528 es múltiplo de 16, necesario para que los 4 MaxPool2d del Tiny U-Net funcionen.
+        # (528 * 256) / 22050 = 6.13 segundos. Más contexto temporal mejora la separación.
+        self.time_frames = 528 
         
         self.chunk_duration = (self.time_frames * self.hop_length) / self.target_sr 
         
@@ -39,11 +39,15 @@ class MUSDB18RandomMixDataset(Dataset):
         # --- NUEVO: DATA AUGMENTATION (Ganancia y Pitch) ---
         # Solo aplicamos estas transformaciones estocásticas si estamos en la fase de 'train'
         if self.split == 'train':
-            # a) Variación de Ganancia: escalamos el volumen aleatoriamente (0.5 a 1.5)
-            gain = random.uniform(0.5, 1.5)
+            # a) Variación de Ganancia: rango amplio para mayor robustez
+            gain = random.uniform(0.3, 2.0)
             resampled_audio = resampled_audio * gain
             
-            # b) Desplazamiento de Tono (Pitch Shifting) ELIMINADO para mejorar rendimiento de CPU.
+            # b) Time shift aleatorio (desplazar ligeramente el audio)
+            if random.random() < 0.3:
+                max_shift = int(0.05 * resampled_audio.shape[-1])  # 5% del largo
+                shift = random.randint(-max_shift, max_shift)
+                resampled_audio = torch.roll(resampled_audio, shifts=shift, dims=-1)
         # ---------------------------------------------------
         
         # 2. STFT (Tensor complejo)
@@ -94,11 +98,9 @@ class MUSDB18RandomMixDataset(Dataset):
         mix_phase = torch.angle(complex_mix)
         y_true_mag = torch.abs(complex_stems_tensor)
         
-        # 5. Compresión Logarítmica
-        x_mix = torch.log1p(mix_mag) / 10.0
-        x_mix = torch.clamp(x_mix, 0.0, 1.0)
+        # 5. Compresión Logarítmica (sin clamp para preservar rango dinámico)
+        x_mix = torch.log1p(mix_mag) / 7.0
         
-        y_true = torch.log1p(y_true_mag) / 10.0
-        y_true = torch.clamp(y_true, 0.0, 1.0)
+        y_true = torch.log1p(y_true_mag) / 7.0
         
         return x_mix, y_true, mix_phase, true_audio

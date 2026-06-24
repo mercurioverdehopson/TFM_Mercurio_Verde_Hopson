@@ -31,7 +31,7 @@ istft = T.InverseSpectrogram(n_fft=n_fft, hop_length=hop_length)
 def spectrogram_to_audio(log_mag, phase):
     """Deshace la normalización, el logaritmo y aplica la iSTFT"""
     # 1. Deshacer escala (x10) y logaritmo (expm1 es la inversa de log1p)
-    mag = torch.expm1(log_mag * 10.0)
+    mag = torch.expm1(log_mag * 7.0)
     
     # 2. Re-añadir la frecuencia de Nyquist (fila de ceros)
     pad_mag = torch.zeros((mag.shape[0], 1, mag.shape[2]), dtype=mag.dtype, device=mag.device)
@@ -47,6 +47,42 @@ def spectrogram_to_audio(log_mag, phase):
     # 4. Inversa de Fourier para volver a onda de tiempo
     audio_wave = istft(complex_spec)
     return audio_wave
+
+def wiener_post_process(pred_stems_log, mix_log, mix_phase):
+    """
+    Post-procesamiento Wiener: refina la separación usando filtros 
+    basados en densidad espectral de potencia (PSD).
+    Reduce artefactos (mejora SAR) al suavizar las máscaras y preservar
+    las relaciones de fase originales de la mezcla.
+    
+    Args:
+        pred_stems_log: (4, F, T) magnitudes predichas (dominio log-comprimido)
+        mix_log: (1, F, T) magnitud de la mezcla (dominio log-comprimido)
+        mix_phase: (1, F, T) fase de la mezcla
+    
+    Returns:
+        refined_audio: (4, time_samples) audio refinado
+    """
+    # 1. Convertir a magnitud lineal
+    pred_linear = torch.expm1(pred_stems_log * 7.0)  # (4, F, T)
+    mix_linear = torch.expm1(mix_log * 7.0)           # (1, F, T)
+    
+    # 2. Filtro Wiener: W_i = |S_i|^2 / (Σ_j |S_j|^2 + ε)
+    power = pred_linear ** 2                           # (4, F, T)
+    power_sum = torch.sum(power, dim=0, keepdim=True) + 1e-10  # (1, F, T)
+    wiener_masks = power / power_sum                   # (4, F, T) suman ~1.0
+    
+    # 3. Reconstruir espectrograma complejo refinado
+    mix_complex = mix_linear * torch.exp(1j * mix_phase)  # (1, F, T)
+    refined_complex = wiener_masks * mix_complex           # (4, F, T) broadcast
+    
+    # 4. Re-añadir Nyquist bin y aplicar iSTFT
+    pad = torch.zeros((refined_complex.shape[0], 1, refined_complex.shape[2]),
+                       dtype=refined_complex.dtype, device=refined_complex.device)
+    refined_complex = torch.cat([refined_complex, pad], dim=1)
+    
+    refined_audio = istft(refined_complex)
+    return refined_audio
 
 def test_model(model, test_loader, device):
     logging.info("Iniciando Fase de Evaluación (Test)")
@@ -68,7 +104,9 @@ def test_model(model, test_loader, device):
             
             # 2. Reconstrucción de Audio
             for i in range(pred_stems_mag.shape[0]): 
-                est_audio = spectrogram_to_audio(pred_stems_mag[i].cpu(), mix_phase[i].cpu())
+                est_audio = wiener_post_process(
+                    pred_stems_mag[i].cpu(), mix[i].cpu(), mix_phase[i].cpu()
+                )
                 ref_audio = true_audio[i].cpu().numpy()
                 est_audio = est_audio.numpy()
                 

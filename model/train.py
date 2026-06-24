@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
+import torchaudio.transforms as T
 import os
 import logging
 import datetime
@@ -24,6 +26,61 @@ logging.basicConfig(
     ]
 )
 
+class MultiResolutionSTFTLoss(nn.Module):
+    """
+    Pérdida multi-resolución STFT: evalúa la calidad de separación
+    a distintas escalas temporales/frecuenciales.
+    Combina Spectral Convergence + Log Magnitude Loss.
+    """
+    def __init__(self, fft_sizes=[512, 1024, 2048], 
+                 hop_sizes=[128, 256, 512], 
+                 win_sizes=[512, 1024, 2048]):
+        super().__init__()
+        self.fft_sizes = fft_sizes
+        self.hop_sizes = hop_sizes
+        self.win_sizes = win_sizes
+
+    def _stft_loss(self, x, y, fft_size, hop_size, win_size):
+        window = torch.hann_window(win_size, device=x.device)
+        x_stft = torch.stft(x, fft_size, hop_size, win_size, window, return_complex=True)
+        y_stft = torch.stft(y, fft_size, hop_size, win_size, window, return_complex=True)
+        
+        x_mag = torch.abs(x_stft)
+        y_mag = torch.abs(y_stft)
+        
+        # Spectral Convergence: Frobenius norm de la diferencia / norm del target
+        sc_loss = torch.norm(y_mag - x_mag, p='fro') / (torch.norm(y_mag, p='fro') + 1e-7)
+        # Log Magnitude Loss
+        mag_loss = torch.mean(torch.abs(torch.log(x_mag + 1e-7) - torch.log(y_mag + 1e-7)))
+        
+        return sc_loss + mag_loss
+
+    def forward(self, x, y):
+        """x, y: (batch, stems, samples) en dominio del tiempo"""
+        B, S, T_len = x.shape
+        x_flat = x.reshape(B * S, T_len)
+        y_flat = y.reshape(B * S, T_len)
+        loss = 0.0
+        for fs, hs, ws in zip(self.fft_sizes, self.hop_sizes, self.win_sizes):
+            loss += self._stft_loss(x_flat, y_flat, fs, hs, ws)
+        return loss / len(self.fft_sizes)
+
+
+def orthogonality_loss(pred_stems):
+    """
+    Penaliza el solapamiento de energía entre stems predichos.
+    Mejora SIR al forzar que cada stem ocupe bins tiempo-frecuencia distintos.
+    """
+    B, S, F, T = pred_stems.shape
+    loss = 0.0
+    count = 0
+    for i in range(S):
+        for j in range(i + 1, S):
+            loss += torch.mean(torch.abs(pred_stems[:, i] * pred_stems[:, j]))
+            count += 1
+    return loss / count
+
+
 def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5):
     logging.info(f"Entrenando en: {device}")
     logging.info(f"Archivo de log creado en: {log_filename}")
@@ -33,10 +90,12 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
 
     # Inicialización del modelo y optimizador
     model = TinyUNetMultiStem().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     
-    # Error Absoluto Medio (MAE) tal y como dicta la metodología
-    criterion = nn.L1Loss() 
+    # Pérdidas: L1 (espectrograma) + Multi-Resolution STFT (audio reconstruido)
+    criterion_l1 = nn.L1Loss()
+    criterion_mrstft = MultiResolutionSTFTLoss().to(device)
+    istft_transform = T.InverseSpectrogram(n_fft=1024, hop_length=256).to(device)
 
     # Variables para el control de Early Stopping
     best_val_loss = float('inf')
@@ -44,9 +103,9 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
     best_model_path = "best_model_checkpoint.pt"
     torch.save(model.state_dict(), best_model_path)
 
-    # Inicialización de Mixed Precision (AMP) y Scheduler — API moderna device-aware
+    # Inicialización de Mixed Precision (AMP) y Scheduler — menos agresivo que antes
     scaler = torch.amp.GradScaler(device=device)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=4)
 
     # Bucle de Epochs
     for epoch in range(epochs):
@@ -60,16 +119,37 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
         # 1. Envolvemos el dataloader con tqdm
         loop_train = tqdm(train_dataloader, desc=f"Epoch [{epoch+1}/{epochs}] Entreno", leave=False)
         
-        for batch_idx, (mix, true_stems, _, _) in enumerate(loop_train):
-            mix, true_stems = mix.to(device, non_blocking=True), true_stems.to(device, non_blocking=True)
+        for batch_idx, (mix, true_stems, mix_phase, true_audio) in enumerate(loop_train):
+            mix = mix.to(device, non_blocking=True)
+            true_stems = true_stems.to(device, non_blocking=True)
+            mix_phase = mix_phase.to(device, non_blocking=True)
+            true_audio = true_audio.to(device, non_blocking=True)
 
-            # Forward Pass con Mixed Precision
+            # Forward Pass con Mixed Precision (L1 Loss)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type):
                 masks = model(mix)
                 mix_expanded = mix.expand_as(masks)
                 pred_stems = masks * mix_expanded
-                loss = criterion(pred_stems, true_stems)
+                l1_loss = criterion_l1(pred_stems, true_stems)
+                ortho = orthogonality_loss(pred_stems)
+            
+            # Multi-Resolution STFT Loss (float32 para estabilidad numérica)
+            with torch.amp.autocast(device_type=device.type, enabled=False):
+                pred_mag = torch.expm1(pred_stems.float() * 7.0)
+                phase_expanded = mix_phase.expand_as(pred_mag)
+                pred_complex = pred_mag * torch.exp(1j * phase_expanded)
+                pred_padded = F.pad(pred_complex, (0, 0, 0, 1))  # Nyquist bin
+                B, S, Fb, Tf = pred_padded.shape
+                pred_audio = istft_transform(pred_padded.reshape(B*S, Fb, Tf))
+                pred_audio = pred_audio.reshape(B, S, -1)
+                
+                min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
+                mrstft_loss = criterion_mrstft(
+                    pred_audio[..., :min_len], true_audio[..., :min_len]
+                )
+            
+            loss = l1_loss + 0.5 * mrstft_loss + 0.1 * ortho
             
             # Backpropagation con AMP
             scaler.scale(loss).backward()
@@ -84,7 +164,7 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
             train_running_loss += loss.item()
             
             # 2. Actualizamos la barra de progreso con el loss actual
-            loop_train.set_postfix(loss=loss.item())
+            loop_train.set_postfix(loss=loss.item(), l1=l1_loss.item(), stft=mrstft_loss.item(), ortho=ortho.item())
 
         avg_train_loss = train_running_loss / len(train_dataloader)
         
@@ -103,15 +183,36 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
         
         # Desactivamos gradientes para la validación
         with torch.no_grad():
-            for batch_idx, (mix, true_stems, _, _) in enumerate(loop_val):
-                mix, true_stems = mix.to(device, non_blocking=True), true_stems.to(device, non_blocking=True)
+            for batch_idx, (mix, true_stems, mix_phase, true_audio) in enumerate(loop_val):
+                mix = mix.to(device, non_blocking=True)
+                true_stems = true_stems.to(device, non_blocking=True)
+                mix_phase = mix_phase.to(device, non_blocking=True)
+                true_audio = true_audio.to(device, non_blocking=True)
                 
                 # Inferir máscaras y predecir con Mixed Precision
                 with torch.amp.autocast(device_type=device.type):
                     masks = model(mix)
                     mix_expanded = mix.expand_as(masks)
                     pred_stems = masks * mix_expanded
-                    loss = criterion(pred_stems, true_stems)
+                    l1_loss = criterion_l1(pred_stems, true_stems)
+                    ortho = orthogonality_loss(pred_stems)
+                
+                # Multi-Resolution STFT Loss
+                with torch.amp.autocast(device_type=device.type, enabled=False):
+                    pred_mag = torch.expm1(pred_stems.float() * 7.0)
+                    phase_expanded = mix_phase.expand_as(pred_mag)
+                    pred_complex = pred_mag * torch.exp(1j * phase_expanded)
+                    pred_padded = F.pad(pred_complex, (0, 0, 0, 1))
+                    B, S, Fb, Tf = pred_padded.shape
+                    pred_audio = istft_transform(pred_padded.reshape(B*S, Fb, Tf))
+                    pred_audio = pred_audio.reshape(B, S, -1)
+                    
+                    min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
+                    mrstft_loss = criterion_mrstft(
+                        pred_audio[..., :min_len], true_audio[..., :min_len]
+                    )
+                
+                loss = l1_loss + 0.5 * mrstft_loss + 0.1 * ortho
                 val_running_loss += loss.item()
                 
                 # 2. Actualizamos la barra de progreso
@@ -170,7 +271,7 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
     learning_rate = 0.0001
 
     model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     criterion = nn.L1Loss()
 
     best_val_loss = float('inf')
@@ -179,7 +280,7 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
     torch.save(model.state_dict(), best_model_path)
 
     scaler = torch.amp.GradScaler(device=device)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=2)
 
     for epoch in range(epochs):
         

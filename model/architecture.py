@@ -97,6 +97,7 @@ class TinyUNetMultiStem(nn.Module):
         d4 = self.upconv4(b)
         d4 = torch.cat([e4, d4], dim=1)
         d4 = self.dec4(d4)
+        d4 = self.dropout(d4)  # Regularización en decoder profundo
         
         d3 = self.upconv3(d4)
         d3 = torch.cat([e3, d3], dim=1)
@@ -113,6 +114,7 @@ class TinyUNetMultiStem(nn.Module):
         # Máscaras
         logits = self.out_conv(d1)
         
-        # Softmax en la dimensión de los canales (dim=1) para que sumen 1.0
-        masks = F.softmax(logits, dim=1) 
+        # Sigmoid: cada máscara es independiente en [0, 1].
+        # Permite solapamiento entre stems (más realista para audio).
+        masks = torch.sigmoid(logits)
         return masks

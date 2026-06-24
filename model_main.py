@@ -27,7 +27,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Iniciando pipeline principal en dispositivo: {device}")
     
-    ruta_dataset = r"C:\Users\mercu\Desktop\tfm\TFM_Mercurio_Verde_Hopson-app\dataset"
+    ruta_dataset = r"/workspace/dataset"
     
     # ==========================================
     # 1. PREPARAR DATASETS
@@ -35,7 +35,7 @@ if __name__ == "__main__":
     logging.info("Preparando Datasets...")
     
     # Train: Utiliza el split 'train' para activar el Data Augmentation (Pitch y Gain)
-    dataset_train = MUSDB18RandomMixDataset(root_dir=ruta_dataset, split='train', samples_per_epoch=1000)
+    dataset_train = MUSDB18RandomMixDataset(root_dir=ruta_dataset, split='train', samples_per_epoch=3000)
     
     # Validación: Utiliza el split 'test' (sin augmentations) para evaluar el overfitting rápido
     dataset_val = MUSDB18RandomMixDataset(root_dir=ruta_dataset, split='test', samples_per_epoch=200)
@@ -51,8 +51,9 @@ if __name__ == "__main__":
         'prefetch_factor': 2,       # Pre-cargar 2 batches por worker
     }
     
-    train_loader = DataLoader(dataset_train, batch_size=64, shuffle=True, **loader_kwargs)
-    val_loader   = DataLoader(dataset_val, batch_size=64, shuffle=False, **loader_kwargs)
+    # Batch size 16: más steps de gradiente por epoch (187 vs 16 anterior)
+    train_loader = DataLoader(dataset_train, batch_size=16, shuffle=True, **loader_kwargs)
+    val_loader   = DataLoader(dataset_val, batch_size=16, shuffle=False, **loader_kwargs)
     test_loader  = DataLoader(dataset_test, batch_size=16, shuffle=False, **loader_kwargs)
 
     # ==========================================
@@ -63,8 +64,8 @@ if __name__ == "__main__":
         train_dataloader=train_loader, 
         val_dataloader=val_loader, 
         device=device, 
-        epochs=50,      # Entrenamiento completo. Early Stopping lo detendrá si es necesario
-        patience=5
+        epochs=150,     # Más epochs con scheduler más suave para convergencia real
+        patience=15     # Más paciencia acorde al scheduler menos agresivo
     )
     
     # ==========================================
