@@ -92,10 +92,10 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
     model = TinyUNetMultiStem().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     
-    # Pérdidas: L1 (espectrograma) + Multi-Resolution STFT (audio reconstruido)
+    # Pérdidas: L1 (espectrograma, en GPU) + Multi-Resolution STFT (en CPU, evita NVRTC)
     criterion_l1 = nn.L1Loss()
-    criterion_mrstft = MultiResolutionSTFTLoss().to(device)
-    istft_transform = T.InverseSpectrogram(n_fft=1024, hop_length=256).to(device)
+    criterion_mrstft = MultiResolutionSTFTLoss()          # CPU: evita libnvrtc-builtins error
+    istft_cpu = T.InverseSpectrogram(n_fft=1024, hop_length=256)  # CPU
 
     # Variables para el control de Early Stopping
     best_val_loss = float('inf')
@@ -134,20 +134,27 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
                 l1_loss = criterion_l1(pred_stems, true_stems)
                 ortho = orthogonality_loss(pred_stems)
             
-            # Multi-Resolution STFT Loss (float32 para estabilidad numérica)
-            with torch.amp.autocast(device_type=device.type, enabled=False):
-                pred_mag = torch.expm1(pred_stems.float() * 7.0)
-                phase_expanded = mix_phase.expand_as(pred_mag)
-                pred_complex = pred_mag * torch.exp(1j * phase_expanded)
-                pred_padded = F.pad(pred_complex, (0, 0, 0, 1))  # Nyquist bin
-                B, S, Fb, Tf = pred_padded.shape
-                pred_audio = istft_transform(pred_padded.reshape(B*S, Fb, Tf))
-                pred_audio = pred_audio.reshape(B, S, -1)
-                
-                min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
-                mrstft_loss = criterion_mrstft(
-                    pred_audio[..., :min_len], true_audio[..., :min_len]
-                )
+            # Multi-Resolution STFT Loss en CPU (evita NVRTC / libnvrtc-builtins error)
+            pred_stems_cpu = pred_stems.detach().float().cpu()
+            mix_phase_cpu  = mix_phase.float().cpu()
+            true_audio_cpu = true_audio.float().cpu()
+            
+            pred_mag_cpu = torch.expm1(pred_stems_cpu * 7.0)
+            phase_exp_cpu = mix_phase_cpu.expand_as(pred_mag_cpu)
+            # torch.complex en vez de exp(1j*...) para evitar compilación CUDA JIT
+            pred_complex_cpu = torch.complex(
+                pred_mag_cpu * torch.cos(phase_exp_cpu),
+                pred_mag_cpu * torch.sin(phase_exp_cpu)
+            )
+            pred_padded_cpu = F.pad(pred_complex_cpu, (0, 0, 0, 1))
+            Bc, Sc, Fbc, Tfc = pred_padded_cpu.shape
+            pred_audio_cpu = istft_cpu(pred_padded_cpu.reshape(Bc*Sc, Fbc, Tfc))
+            pred_audio_cpu = pred_audio_cpu.reshape(Bc, Sc, -1)
+            
+            min_len = min(pred_audio_cpu.shape[-1], true_audio_cpu.shape[-1])
+            mrstft_loss = criterion_mrstft(
+                pred_audio_cpu[..., :min_len], true_audio_cpu[..., :min_len]
+            ).to(device)  # Devolver escalar a GPU para backprop
             
             loss = l1_loss + 0.5 * mrstft_loss + 0.1 * ortho
             
@@ -197,20 +204,26 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
                     l1_loss = criterion_l1(pred_stems, true_stems)
                     ortho = orthogonality_loss(pred_stems)
                 
-                # Multi-Resolution STFT Loss
-                with torch.amp.autocast(device_type=device.type, enabled=False):
-                    pred_mag = torch.expm1(pred_stems.float() * 7.0)
-                    phase_expanded = mix_phase.expand_as(pred_mag)
-                    pred_complex = pred_mag * torch.exp(1j * phase_expanded)
-                    pred_padded = F.pad(pred_complex, (0, 0, 0, 1))
-                    B, S, Fb, Tf = pred_padded.shape
-                    pred_audio = istft_transform(pred_padded.reshape(B*S, Fb, Tf))
-                    pred_audio = pred_audio.reshape(B, S, -1)
-                    
-                    min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
-                    mrstft_loss = criterion_mrstft(
-                        pred_audio[..., :min_len], true_audio[..., :min_len]
-                    )
+                # Multi-Resolution STFT Loss en CPU
+                pred_stems_cpu = pred_stems.float().cpu()
+                mix_phase_cpu  = mix_phase.float().cpu()
+                true_audio_cpu = true_audio.float().cpu()
+                
+                pred_mag_cpu = torch.expm1(pred_stems_cpu * 7.0)
+                phase_exp_cpu = mix_phase_cpu.expand_as(pred_mag_cpu)
+                pred_complex_cpu = torch.complex(
+                    pred_mag_cpu * torch.cos(phase_exp_cpu),
+                    pred_mag_cpu * torch.sin(phase_exp_cpu)
+                )
+                pred_padded_cpu = F.pad(pred_complex_cpu, (0, 0, 0, 1))
+                Bc, Sc, Fbc, Tfc = pred_padded_cpu.shape
+                pred_audio_cpu = istft_cpu(pred_padded_cpu.reshape(Bc*Sc, Fbc, Tfc))
+                pred_audio_cpu = pred_audio_cpu.reshape(Bc, Sc, -1)
+                
+                min_len = min(pred_audio_cpu.shape[-1], true_audio_cpu.shape[-1])
+                mrstft_loss = criterion_mrstft(
+                    pred_audio_cpu[..., :min_len], true_audio_cpu[..., :min_len]
+                ).to(device)
                 
                 loss = l1_loss + 0.5 * mrstft_loss + 0.1 * ortho
                 val_running_loss += loss.item()
