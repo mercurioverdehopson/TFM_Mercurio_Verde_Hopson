@@ -113,39 +113,27 @@ def si_sdr_loss(pred, target):
         torch.sum(s_target ** 2, dim=-1) / (torch.sum(e_noise ** 2, dim=-1) + 1e-8) + 1e-8
     )
     
-    return -si_sdr.mean()  # Negativo porque queremos maximizar SDR
+    return -si_sdr.mean()
 
 
 def reconstruct_audio(pred_log_mag, mix_phase, n_fft=1024, hop_length=256):
     """
-    Reconstruye audio temporal desde espectrogramas log-comprimidos predichos.
-    Todas las operaciones son diferenciables para permitir backpropagation.
-    
-    Args:
-        pred_log_mag: (B, 4, 512, T) magnitudes predichas (dominio log-comprimido)
-        mix_phase: (B, 1, 512, T) fase de la mezcla
-    Returns:
-        audio: (B, 4, audio_samples)
+    Reconstruye audio temporal para evaluar SI-SDR sin gradientes.
     """
     B, S, F, T = pred_log_mag.shape
     
-    # 1. Deshacer compresión logarítmica
     mag = torch.expm1(pred_log_mag * 7.0)
     
-    # 2. Añadir bin de Nyquist (fila de ceros)
     pad = torch.zeros(B, S, 1, T, device=mag.device, dtype=mag.dtype)
-    mag = torch.cat([mag, pad], dim=2)  # (B, 4, 513, T)
+    mag = torch.cat([mag, pad], dim=2)
     
-    # 3. Expandir la fase de la mezcla a todos los stems
     phase = mix_phase.expand(-1, S, -1, -1)
     pad_phase = torch.zeros(B, S, 1, T, device=phase.device, dtype=phase.dtype)
-    phase = torch.cat([phase, pad_phase], dim=2)  # (B, 4, 513, T)
+    phase = torch.cat([phase, pad_phase], dim=2)
     
-    # 4. Reconstruir espectrograma complejo
     complex_spec = mag * torch.exp(1j * phase)
-    
-    # 5. iSTFT (reshape para procesar todos los stems en un solo batch)
     complex_spec = complex_spec.reshape(B * S, F + 1, T)
+    
     window = torch.hann_window(n_fft, device=complex_spec.device)
     audio = torch.istft(complex_spec, n_fft=n_fft, hop_length=hop_length,
                         window=window, length=T * hop_length)
@@ -196,7 +184,7 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
             mix_phase = mix_phase.to(device, non_blocking=True)
             true_audio = true_audio.to(device, non_blocking=True)
 
-            # Forward Pass con Mixed Precision (L1 + SI-SDR + Ortho)
+            # Forward Pass con Mixed Precision (L1 + Ortho)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type):
                 masks = model(mix)
@@ -205,12 +193,8 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
                 l1_loss = criterion_l1(pred_stems, true_stems)
                 ortho = orthogonality_loss(pred_stems)
             
-            # SI-SDR en dominio temporal (fuera de autocast para estabilidad numérica con complejos)
-            pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
-            min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
-            si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
-            
-            loss = l1_loss + 0.5 * si_sdr + 0.1 * ortho
+            # Entrenamiento súper rápido solo con métricas de espectrograma
+            loss = l1_loss + 0.1 * ortho
             
             # Backpropagation con AMP
             scaler.scale(loss).backward()
@@ -225,7 +209,7 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
             train_running_loss += loss.item()
             
             # 2. Actualizamos la barra de progreso con el loss actual
-            loop_train.set_postfix(loss=loss.item(), l1=l1_loss.item(), sdr=si_sdr.item(), ortho=ortho.item())
+            loop_train.set_postfix(loss=loss.item(), l1=l1_loss.item(), ortho=ortho.item())
 
         avg_train_loss = train_running_loss / len(train_dataloader)
         
@@ -258,7 +242,7 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
                     l1_loss = criterion_l1(pred_stems, true_stems)
                     ortho = orthogonality_loss(pred_stems)
                 
-                # SI-SDR en dominio temporal
+                # SI-SDR Real en dominio temporal (rápido por estar en torch.no_grad)
                 pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
                 min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
                 si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
@@ -356,12 +340,8 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
                 pred_stems = masks * mix_expanded
                 l1_loss = criterion(pred_stems, true_stems)
             
-            # SI-SDR en dominio temporal
-            pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
-            min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
-            si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
-            
-            loss = l1_loss + 0.2 * si_sdr
+            # Entrenamiento rápido (solo L1)
+            loss = l1_loss
             
             scaler.scale(loss).backward()
             
@@ -372,7 +352,7 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
             scaler.update()
             
             train_running_loss += loss.item()
-            loop_train.set_postfix(loss=loss.item(), l1=l1_loss.item(), sdr=si_sdr.item())
+            loop_train.set_postfix(loss=loss.item(), l1=l1_loss.item())
 
         avg_train_loss = train_running_loss / len(train_dataloader)
         
@@ -400,7 +380,7 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
                     pred_stems = masks * mix_expanded
                     l1_loss = criterion(pred_stems, true_stems)
                 
-                # SI-SDR en dominio temporal
+                # SI-SDR Real temporal solo en validación
                 pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
                 min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
                 si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])

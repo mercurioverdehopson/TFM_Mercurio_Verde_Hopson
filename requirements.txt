@@ -1,5 +1,5 @@
-torch==2.11.0
-torchaudio==2.11.0
+# torch (ya instalado en RunPod)
+# torchaudio (ya instalado en RunPod)
 onnxruntime==1.21.0
 onnxscript==0.7.0
 tqdm==4.67.1
