@@ -65,9 +65,18 @@ class MUSDB18RandomMixDataset(Dataset):
         stems_audio = torch.empty(4, self.time_frames * self.hop_length)
         
         # 1. Seleccionar UNA canción y UN punto temporal para todos los stems (mezcla coherente)
-        track = random.choice(self.mus.tracks)
-        max_start = max(0, track.duration - self.chunk_duration)
-        start_time = random.uniform(0, max_start)
+        if self.split == 'test':
+            # Generador determinista para validación. Garantiza que el batch 'idx'
+            # SIEMPRE devuelve el mismo fragmento de audio en todos los epochs.
+            rng = random.Random(idx + 42)
+            track = rng.choice(self.mus.tracks)
+            max_start = max(0, track.duration - self.chunk_duration)
+            start_time = rng.uniform(0, max_start)
+        else:
+            # Aleatoriedad total para el entrenamiento
+            track = random.choice(self.mus.tracks)
+            max_start = max(0, track.duration - self.chunk_duration)
+            start_time = random.uniform(0, max_start)
         
         track.chunk_start = start_time
         track.chunk_duration = self.chunk_duration
