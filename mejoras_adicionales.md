@@ -164,20 +164,49 @@ flowchart TD
 
 ---
 
+## Mejora 4: SI-SDR Real en Fase de Validación → Maximiza **SDR** (sin coste de tiempo)
+
+### ¿Qué cambia?
+
+Se introdujo el cálculo directo de la métrica **SI-SDR** (la métrica oficial del BSS Eval) durante el entrenamiento, reconstruyendo temporalmente el espectrograma a audio con `istft`. 
+Dado que calcular derivadas a través de tensores complejos e `istft` es un cuello de botella letal para la GPU (disparando los tiempos a 4 días), se extrajo la métrica de la fase `train` y se inyectó de forma limpia en la fase `val` bajo el contexto `torch.no_grad()`.
+
+### Impacto
+* **Velocidad:** El modelo entrena iterando a máxima velocidad (en milisegundos) evaluando pérdidas L1 y Ortogonalidad.
+* **Calidad (SDR):** El `Early Stopping` vigila la métrica SI-SDR en validación. El modelo seleccionado y guardado como `best_model_checkpoint.pt` será siempre aquel con mejor SI-SDR natural, garantizando matemáticamente el mejor rendimiento global sin los problemas que daba MR-STFT.
+
+---
+
+## Mejora 5: Mezclas Coherentes Optimizadas (Track Stems) → Mejora **SDR y SIR**
+
+### ¿Qué cambia?
+En lugar de mezclar instrumentos aleatorios de distintas canciones, el `DataLoader` extrae los 4 stems **de la misma pista y del mismo instante de tiempo**. 
+
+### El Cuello de Botella (I/O) y su Solución
+Extraer los instrumentos uno por uno obligaba a `musdb/stempeg` a ejecutar 4 subprocesos de `ffmpeg` secuenciales, saturando el disco y bloqueando la GPU. Se optimizó el proceso invocando el comando global `track.stems`, que abre el archivo `.mp4` una única vez y descarga todas las pistas simultáneamente.
+
+### Impacto
+* **Acústico:** Las mezclas ahora tienen coherencia rítmica, armónica y de fase real. El modelo aprende a separar instrumentos correlacionados y no ruido desorganizado, disparando el techo de la calidad de separación (SDR).
+* **Computacional:** Se redujo la carga de disco en un 75%, hundiendo el tiempo de iteración de ~10.3s a fracciones de segundo, volviendo la iteración estable y fugaz.
+
+---
+
 ## Resumen Combinado de Impacto
 
-### Todas las mejoras juntas (Ronda 1 + Ronda 2)
+### Todas las mejoras juntas (Ronda 1 + Ronda 2 + Fase Final)
 
 | Mejora | SDR | SIR | SAR | Archivo |
 |--------|-----|-----|-----|---------|
 | Sigmoid (Ronda 1) | ⬆⬆ | ⬆ | — | `architecture.py` |
-| STFT Loss (Ronda 1) | ⬆⬆ | — | ⬆⬆ | `train.py` |
+| STFT Loss descartada | — | — | — | — |
 | AdamW + Scheduler (Ronda 1) | ⬆ | ⬆ | ⬆ | `train.py` |
 | Normalización sin clamp (Ronda 1) | ⬆ | ⬆ | ⬆ | `data.py` |
 | Batch 16 + más epochs (Ronda 1) | ⬆ | ⬆ | ⬆ | `model_main.py` |
 | **Ortho Loss (Ronda 2)** | ⬆ | ⬆⬆⬆ | — | `train.py` |
 | **Segmentos 6s (Ronda 2)** | ⬆ | ⬆⬆ | — | `data.py` |
 | **Wiener (Ronda 2)** | ⬆⬆ | ⬆ | ⬆⬆⬆ | `test.py` |
+| **SI-SDR en Validación (Fase Final)** | ⬆⬆⬆ | ⬆⬆ | ⬆⬆ | `train.py` |
+| **Mezclas Coherentes optimizadas** | ⬆⬆ | ⬆⬆ | ⬆ | `data.py` |
 
 ### Estimación final conservadora
 

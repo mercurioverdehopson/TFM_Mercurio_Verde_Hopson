@@ -43,12 +43,12 @@ if __name__ == "__main__":
     # Test: Evaluación final estricta
     dataset_test = MUSDB18RandomMixDataset(root_dir=ruta_dataset, split='test', samples_per_epoch=100)
     
-    # Configuración óptima para RunPod con GPU: workers paralelos + pin_memory
+    # Configuración agresiva para aprovechar los 57GB de RAM y la CPU AMD EPYC
     loader_kwargs = {
-        'num_workers': 4,           # 4 procesos paralelos para precargar datos
+        'num_workers': 12,          # 12 procesos paralelos para descodificar MP4 a toda velocidad
         'pin_memory': True,         # Memoria fija para transferencia rápida CPU→GPU
         'persistent_workers': True, # Reusar procesos entre epochs (evita fork overhead)
-        'prefetch_factor': 2,       # Pre-cargar 2 batches por worker
+        'prefetch_factor': 4,       # Pre-cargar 4 batches por worker (mucha RAM disponible)
     }
     
     # Batch size 16: más steps de gradiente por epoch (187 vs 16 anterior)
