@@ -77,8 +77,14 @@ class MUSDB18RandomMixDataset(Dataset):
         track.chunk_start = start_time
         track.chunk_duration = self.chunk_duration
         
-        for i, inst in enumerate(self.instruments):
-            complex_spec, audio_wave = self._process_audio(track.targets[inst].audio)
+        # Optimización masiva de I/O: track.stems lee todos los instrumentos a la vez
+        # mediante una sola llamada a ffmpeg (devuelve array de forma 5, samples, channels).
+        # Índices MUSDB18: 0=mezcla, 1=drums, 2=bass, 3=other, 4=vocals
+        stems_array = track.stems
+        target_indices = [4, 1, 2, 3] # Orden de self.instruments: ['vocals', 'drums', 'bass', 'other']
+        
+        for i, stem_idx in enumerate(target_indices):
+            complex_spec, audio_wave = self._process_audio(stems_array[stem_idx])
             stems_complex[i] = complex_spec[0]
             stems_audio[i] = audio_wave[0]
             
