@@ -36,17 +36,12 @@ class MUSDB18RandomMixDataset(Dataset):
         mono_audio = torch.mean(audio_tensor, dim=0, keepdim=True)
         resampled_audio = self.resample(mono_audio)
         
-        # --- NUEVO: DATA AUGMENTATION (Ganancia y Pitch) ---
-        # Solo aplicamos estas transformaciones estocásticas si estamos en la fase de 'train'
+        # --- DATA AUGMENTATION (Fase Train) ---
         if self.split == 'train':
-            # a) Variación de Ganancia: rango amplio para mayor robustez
+            # Variación de ganancia estocástica
             gain = random.uniform(0.3, 2.0)
             resampled_audio = resampled_audio * gain
             
-            # Time shift eliminado: con mezclas coherentes (misma canción),
-            # desplazar un stem rompería la sincronización entre instrumentos.
-        # ---------------------------------------------------
-        
         # 2. STFT (Tensor complejo)
         complex_spec = self.stft(resampled_audio) 
         complex_spec = complex_spec[:, :-1, :] # Descartar Nyquist (512 bandas)

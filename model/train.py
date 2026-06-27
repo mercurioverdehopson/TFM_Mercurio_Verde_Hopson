@@ -26,46 +26,6 @@ logging.basicConfig(
     ]
 )
 
-class MultiResolutionSTFTLoss(nn.Module):
-    """
-    Pérdida multi-resolución STFT: evalúa la calidad de separación
-    a distintas escalas temporales/frecuenciales.
-    Combina Spectral Convergence + Log Magnitude Loss.
-    """
-    def __init__(self, fft_sizes=[512, 1024, 2048], 
-                 hop_sizes=[128, 256, 512], 
-                 win_sizes=[512, 1024, 2048]):
-        super().__init__()
-        self.fft_sizes = fft_sizes
-        self.hop_sizes = hop_sizes
-        self.win_sizes = win_sizes
-
-    def _stft_loss(self, x, y, fft_size, hop_size, win_size):
-        window = torch.hann_window(win_size, device=x.device)
-        x_stft = torch.stft(x, fft_size, hop_size, win_size, window, return_complex=True)
-        y_stft = torch.stft(y, fft_size, hop_size, win_size, window, return_complex=True)
-        
-        x_mag = torch.abs(x_stft)
-        y_mag = torch.abs(y_stft)
-        
-        # Spectral Convergence: Frobenius norm de la diferencia / norm del target
-        sc_loss = torch.norm(y_mag - x_mag, p='fro') / (torch.norm(y_mag, p='fro') + 1e-7)
-        # Log Magnitude Loss
-        mag_loss = torch.mean(torch.abs(torch.log(x_mag + 1e-7) - torch.log(y_mag + 1e-7)))
-        
-        return sc_loss + mag_loss
-
-    def forward(self, x, y):
-        """x, y: (batch, stems, samples) en dominio del tiempo"""
-        B, S, T_len = x.shape
-        x_flat = x.reshape(B * S, T_len)
-        y_flat = y.reshape(B * S, T_len)
-        loss = 0.0
-        for fs, hs, ws in zip(self.fft_sizes, self.hop_sizes, self.win_sizes):
-            loss += self._stft_loss(x_flat, y_flat, fs, hs, ws)
-        return loss / len(self.fft_sizes)
-
-
 def orthogonality_loss(pred_stems):
     """
     Penaliza el solapamiento de energía entre stems predichos.
@@ -152,8 +112,7 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
     model = TinyUNetMultiStem().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     
-    # Pérdidas: L1 (espectrograma)
-    # MRSTFT desactivada temporalmente por incompatibilidad de librerías en contenedor (CUDA NVRTC)
+    # Pérdida: L1 (espectrograma)
     criterion_l1 = nn.L1Loss()
 
     # Variables para el control de Early Stopping
@@ -178,11 +137,9 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
         # 1. Envolvemos el dataloader con tqdm
         loop_train = tqdm(train_dataloader, desc=f"Epoch [{epoch+1}/{epochs}] Entreno", leave=False)
         
-        for batch_idx, (mix, true_stems, mix_phase, true_audio) in enumerate(loop_train):
+        for batch_idx, (mix, true_stems, _, _) in enumerate(loop_train):
             mix = mix.to(device, non_blocking=True)
             true_stems = true_stems.to(device, non_blocking=True)
-            mix_phase = mix_phase.to(device, non_blocking=True)
-            true_audio = true_audio.to(device, non_blocking=True)
 
             # Forward Pass con Mixed Precision (L1 + Ortho)
             optimizer.zero_grad(set_to_none=True)
@@ -281,13 +238,8 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
 
     logging.info("Entrenamiento finalizado.")
     
-    # Restauramos siempre los mejores pesos antes de devolver el modelo, 
-    # ya sea por Early Stopping o por haber completado todas las epochs.
+    # Restauramos siempre los mejores pesos antes de devolver el modelo
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
-    
-    # Limpiar checkpoint temporal (MODIFICADO: ya no se borra para conservar el .pt)
-    # if os.path.exists(best_model_path):
-    #     os.remove(best_model_path)
     
     return model
 
@@ -327,11 +279,9 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
         
         loop_train = tqdm(train_dataloader, desc=f"FT Epoch [{epoch+1}/{epochs}] Entreno", leave=False)
         
-        for batch_idx, (mix, true_stems, mix_phase, true_audio) in enumerate(loop_train):
+        for batch_idx, (mix, true_stems, _, _) in enumerate(loop_train):
             mix = mix.to(device, non_blocking=True)
             true_stems = true_stems.to(device, non_blocking=True)
-            mix_phase = mix_phase.to(device, non_blocking=True)
-            true_audio = true_audio.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type):
@@ -414,9 +364,5 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
     logging.info("Fine-Tuning post-poda finalizado.")
     
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
-    
-    # (MODIFICADO: ya no se borra para conservar el .pt)
-    # if os.path.exists(best_model_path):
-    #     os.remove(best_model_path)
     
     return model
