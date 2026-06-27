@@ -81,6 +81,78 @@ def orthogonality_loss(pred_stems):
     return loss / count
 
 
+def si_sdr_loss(pred, target):
+    """
+    Scale-Invariant Signal-to-Distortion Ratio Loss.
+    Mide directamente la distorsión en dominio temporal (audio).
+    Es la métrica que más correlaciona con SDR de BSS Eval.
+    
+    Args:
+        pred: (B, S, T) audio predicho
+        target: (B, S, T) audio real
+    Returns:
+        Negativo del SI-SDR medio (para minimizar)
+    """
+    pred = pred.reshape(-1, pred.shape[-1])
+    target = target.reshape(-1, target.shape[-1])
+    
+    # Zero-mean (Scale-Invariant)
+    pred = pred - pred.mean(dim=-1, keepdim=True)
+    target = target - target.mean(dim=-1, keepdim=True)
+    
+    # Proyección: s_target = <pred, target> * target / ||target||^2
+    dot = torch.sum(pred * target, dim=-1, keepdim=True)
+    s_target_energy = torch.sum(target ** 2, dim=-1, keepdim=True) + 1e-8
+    s_target = dot * target / s_target_energy
+    
+    # Ruido residual
+    e_noise = pred - s_target
+    
+    # SI-SDR = 10 * log10(||s_target||^2 / ||e_noise||^2)
+    si_sdr = 10 * torch.log10(
+        torch.sum(s_target ** 2, dim=-1) / (torch.sum(e_noise ** 2, dim=-1) + 1e-8) + 1e-8
+    )
+    
+    return -si_sdr.mean()  # Negativo porque queremos maximizar SDR
+
+
+def reconstruct_audio(pred_log_mag, mix_phase, n_fft=1024, hop_length=256):
+    """
+    Reconstruye audio temporal desde espectrogramas log-comprimidos predichos.
+    Todas las operaciones son diferenciables para permitir backpropagation.
+    
+    Args:
+        pred_log_mag: (B, 4, 512, T) magnitudes predichas (dominio log-comprimido)
+        mix_phase: (B, 1, 512, T) fase de la mezcla
+    Returns:
+        audio: (B, 4, audio_samples)
+    """
+    B, S, F, T = pred_log_mag.shape
+    
+    # 1. Deshacer compresión logarítmica
+    mag = torch.expm1(pred_log_mag * 7.0)
+    
+    # 2. Añadir bin de Nyquist (fila de ceros)
+    pad = torch.zeros(B, S, 1, T, device=mag.device, dtype=mag.dtype)
+    mag = torch.cat([mag, pad], dim=2)  # (B, 4, 513, T)
+    
+    # 3. Expandir la fase de la mezcla a todos los stems
+    phase = mix_phase.expand(-1, S, -1, -1)
+    pad_phase = torch.zeros(B, S, 1, T, device=phase.device, dtype=phase.dtype)
+    phase = torch.cat([phase, pad_phase], dim=2)  # (B, 4, 513, T)
+    
+    # 4. Reconstruir espectrograma complejo
+    complex_spec = mag * torch.exp(1j * phase)
+    
+    # 5. iSTFT (reshape para procesar todos los stems en un solo batch)
+    complex_spec = complex_spec.reshape(B * S, F + 1, T)
+    window = torch.hann_window(n_fft, device=complex_spec.device)
+    audio = torch.istft(complex_spec, n_fft=n_fft, hop_length=hop_length,
+                        window=window, length=T * hop_length)
+    
+    return audio.reshape(B, S, -1)
+
+
 def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5):
     logging.info(f"Entrenando en: {device}")
     logging.info(f"Archivo de log creado en: {log_filename}")
@@ -102,9 +174,9 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
     best_model_path = "best_model_checkpoint.pt"
     torch.save(model.state_dict(), best_model_path)
 
-    # Inicialización de Mixed Precision (AMP) y Scheduler — menos agresivo que antes
+    # Inicialización de Mixed Precision (AMP) y Scheduler (Cosine Annealing)
     scaler = torch.amp.GradScaler(device=device)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     # Bucle de Epochs
     for epoch in range(epochs):
@@ -124,7 +196,7 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
             mix_phase = mix_phase.to(device, non_blocking=True)
             true_audio = true_audio.to(device, non_blocking=True)
 
-            # Forward Pass con Mixed Precision (L1 Loss)
+            # Forward Pass con Mixed Precision (L1 + SI-SDR + Ortho)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type):
                 masks = model(mix)
@@ -133,7 +205,12 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
                 l1_loss = criterion_l1(pred_stems, true_stems)
                 ortho = orthogonality_loss(pred_stems)
             
-            loss = l1_loss + 0.1 * ortho
+            # SI-SDR en dominio temporal (fuera de autocast para estabilidad numérica con complejos)
+            pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
+            min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
+            si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
+            
+            loss = l1_loss + 0.5 * si_sdr + 0.1 * ortho
             
             # Backpropagation con AMP
             scaler.scale(loss).backward()
@@ -148,7 +225,7 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
             train_running_loss += loss.item()
             
             # 2. Actualizamos la barra de progreso con el loss actual
-            loop_train.set_postfix(loss=loss.item(), l1=l1_loss.item(), ortho=ortho.item())
+            loop_train.set_postfix(loss=loss.item(), l1=l1_loss.item(), sdr=si_sdr.item(), ortho=ortho.item())
 
         avg_train_loss = train_running_loss / len(train_dataloader)
         
@@ -180,18 +257,24 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
                     pred_stems = masks * mix_expanded
                     l1_loss = criterion_l1(pred_stems, true_stems)
                     ortho = orthogonality_loss(pred_stems)
-                loss = l1_loss + 0.1 * ortho
+                
+                # SI-SDR en dominio temporal
+                pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
+                min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
+                si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
+                
+                loss = l1_loss + 0.5 * si_sdr + 0.1 * ortho
                 val_running_loss += loss.item()
                 
                 # 2. Actualizamos la barra de progreso
-                loop_val.set_postfix(loss=loss.item())
+                loop_val.set_postfix(loss=loss.item(), l1=l1_loss.item(), sdr=si_sdr.item())
                 
         avg_val_loss = val_running_loss / len(val_dataloader)
 
-        logging.info(f"Epoch [{epoch+1}/{epochs}] - Loss L1 Entreno: {avg_train_loss:.4f} | Loss L1 Validación: {avg_val_loss:.4f}")
+        logging.info(f"Epoch [{epoch+1}/{epochs}] - Loss Total Entreno: {avg_train_loss:.4f} | Loss Total Validación: {avg_val_loss:.4f}")
         
-        # Actualizar el Scheduler basado en el loss de validación
-        scheduler.step(avg_val_loss)
+        # Actualizar el Scheduler (Cosine Annealing)
+        scheduler.step()
 
         # ==========================================
         # FASE 3: EARLY STOPPING
@@ -218,9 +301,9 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
     # ya sea por Early Stopping o por haber completado todas las epochs.
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
     
-    # Limpiar checkpoint temporal
-    if os.path.exists(best_model_path):
-        os.remove(best_model_path)
+    # Limpiar checkpoint temporal (MODIFICADO: ya no se borra para conservar el .pt)
+    # if os.path.exists(best_model_path):
+    #     os.remove(best_model_path)
     
     return model
 
@@ -260,15 +343,25 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
         
         loop_train = tqdm(train_dataloader, desc=f"FT Epoch [{epoch+1}/{epochs}] Entreno", leave=False)
         
-        for batch_idx, (mix, true_stems, _, _) in enumerate(loop_train):
-            mix, true_stems = mix.to(device, non_blocking=True), true_stems.to(device, non_blocking=True)
+        for batch_idx, (mix, true_stems, mix_phase, true_audio) in enumerate(loop_train):
+            mix = mix.to(device, non_blocking=True)
+            true_stems = true_stems.to(device, non_blocking=True)
+            mix_phase = mix_phase.to(device, non_blocking=True)
+            true_audio = true_audio.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type):
                 masks = model(mix)
                 mix_expanded = mix.expand_as(masks)
                 pred_stems = masks * mix_expanded
-                loss = criterion(pred_stems, true_stems)
+                l1_loss = criterion(pred_stems, true_stems)
+            
+            # SI-SDR en dominio temporal
+            pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
+            min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
+            si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
+            
+            loss = l1_loss + 0.2 * si_sdr
             
             scaler.scale(loss).backward()
             
@@ -279,7 +372,7 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
             scaler.update()
             
             train_running_loss += loss.item()
-            loop_train.set_postfix(loss=loss.item())
+            loop_train.set_postfix(loss=loss.item(), l1=l1_loss.item(), sdr=si_sdr.item())
 
         avg_train_loss = train_running_loss / len(train_dataloader)
         
@@ -295,20 +388,30 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
         loop_val = tqdm(val_dataloader, desc=f"FT Epoch [{epoch+1}/{epochs}] Valid", leave=False)
         
         with torch.no_grad():
-            for batch_idx, (mix, true_stems, _, _) in enumerate(loop_val):
-                mix, true_stems = mix.to(device, non_blocking=True), true_stems.to(device, non_blocking=True)
+            for batch_idx, (mix, true_stems, mix_phase, true_audio) in enumerate(loop_val):
+                mix = mix.to(device, non_blocking=True)
+                true_stems = true_stems.to(device, non_blocking=True)
+                mix_phase = mix_phase.to(device, non_blocking=True)
+                true_audio = true_audio.to(device, non_blocking=True)
                 
                 with torch.amp.autocast(device_type=device.type):
                     masks = model(mix)
                     mix_expanded = mix.expand_as(masks)
                     pred_stems = masks * mix_expanded
-                    loss = criterion(pred_stems, true_stems)
+                    l1_loss = criterion(pred_stems, true_stems)
+                
+                # SI-SDR en dominio temporal
+                pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
+                min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
+                si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
+                
+                loss = l1_loss + 0.2 * si_sdr
                 val_running_loss += loss.item()
-                loop_val.set_postfix(loss=loss.item())
+                loop_val.set_postfix(loss=loss.item(), l1=l1_loss.item(), sdr=si_sdr.item())
                 
         avg_val_loss = val_running_loss / len(val_dataloader)
 
-        logging.info(f"FT Epoch [{epoch+1}/{epochs}] - Loss L1 Entreno: {avg_train_loss:.4f} | Loss L1 Validación: {avg_val_loss:.4f}")
+        logging.info(f"FT Epoch [{epoch+1}/{epochs}] - Loss Total Entreno: {avg_train_loss:.4f} | Loss Total Validación: {avg_val_loss:.4f}")
         
         scheduler.step(avg_val_loss)
 
@@ -332,7 +435,8 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
     
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
     
-    if os.path.exists(best_model_path):
-        os.remove(best_model_path)
+    # (MODIFICADO: ya no se borra para conservar el .pt)
+    # if os.path.exists(best_model_path):
+    #     os.remove(best_model_path)
     
     return model

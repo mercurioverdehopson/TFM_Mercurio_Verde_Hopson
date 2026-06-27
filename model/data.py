@@ -43,11 +43,8 @@ class MUSDB18RandomMixDataset(Dataset):
             gain = random.uniform(0.3, 2.0)
             resampled_audio = resampled_audio * gain
             
-            # b) Time shift aleatorio (desplazar ligeramente el audio)
-            if random.random() < 0.3:
-                max_shift = int(0.05 * resampled_audio.shape[-1])  # 5% del largo
-                shift = random.randint(-max_shift, max_shift)
-                resampled_audio = torch.roll(resampled_audio, shifts=shift, dims=-1)
+            # Time shift eliminado: con mezclas coherentes (misma canción),
+            # desplazar un stem rompería la sincronización entre instrumentos.
         # ---------------------------------------------------
         
         # 2. STFT (Tensor complejo)
@@ -72,15 +69,15 @@ class MUSDB18RandomMixDataset(Dataset):
         stems_complex = torch.empty(4, 512, self.time_frames, dtype=torch.cfloat)
         stems_audio = torch.empty(4, self.time_frames * self.hop_length)
         
-        # 1. Extraer fragmentos aleatorios
+        # 1. Seleccionar UNA canción y UN punto temporal para todos los stems (mezcla coherente)
+        track = random.choice(self.mus.tracks)
+        max_start = max(0, track.duration - self.chunk_duration)
+        start_time = random.uniform(0, max_start)
+        
+        track.chunk_start = start_time
+        track.chunk_duration = self.chunk_duration
+        
         for i, inst in enumerate(self.instruments):
-            track = random.choice(self.mus.tracks)
-            max_start = max(0, track.duration - self.chunk_duration)
-            start_time = random.uniform(0, max_start)
-            
-            track.chunk_start = start_time
-            track.chunk_duration = self.chunk_duration
-            
             complex_spec, audio_wave = self._process_audio(track.targets[inst].audio)
             stems_complex[i] = complex_spec[0]
             stems_audio[i] = audio_wave[0]
@@ -90,7 +87,7 @@ class MUSDB18RandomMixDataset(Dataset):
         complex_stems_tensor = stems_complex
         true_audio = stems_audio
         
-        # 3. Crear la mezcla "Frankenstein"
+        # 3. Crear la mezcla sumando los stems coherentes
         complex_mix = torch.sum(complex_stems_tensor, dim=0, keepdim=True) 
         
         # 4. Separar Magnitud y Fase

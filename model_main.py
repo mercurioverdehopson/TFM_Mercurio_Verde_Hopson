@@ -68,6 +68,14 @@ if __name__ == "__main__":
         patience=15     # Más paciencia acorde al scheduler menos agresivo
     )
     
+    # Guardar checkpoint del modelo pre-poda
+    torch.save(trained_model.state_dict(), "modelo_pre_poda.pt")
+    logging.info("Checkpoint pre-poda guardado: modelo_pre_poda.pt")
+    
+    # Evaluación BSS EVAL del modelo ANTES de la poda (para comparativa en la memoria)
+    logging.info("--- Evaluación Pre-Poda (BSS EVAL) ---")
+    test_model(trained_model, test_loader, device=device)
+    
     # ==========================================
     # 3. COMPRESIÓN: PODA ESTRUCTURAL (10%)
     # ==========================================
@@ -88,6 +96,10 @@ if __name__ == "__main__":
         epochs=10,
         patience=3
     )
+    
+    # Guardar checkpoint del modelo post-poda
+    torch.save(finetuned_model.state_dict(), "modelo_post_poda.pt")
+    logging.info("Checkpoint post-poda guardado: modelo_post_poda.pt")
     
     # ==========================================
     # 5. EVALUACIÓN (Métricas BSS EVAL)
