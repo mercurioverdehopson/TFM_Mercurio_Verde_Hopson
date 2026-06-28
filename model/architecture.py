@@ -48,6 +48,25 @@ class DoubleConv(nn.Module):
         out += res
         return self.final_relu(out)
 
+class RNNBottleneck(nn.Module):
+    def __init__(self, channels, freq_bins, hidden_size=256):
+        super().__init__()
+        self.in_features = channels * freq_bins
+        self.fc_in = nn.Linear(self.in_features, hidden_size)
+        self.lstm = nn.LSTM(hidden_size, hidden_size // 2, bidirectional=True, batch_first=True)
+        self.fc_out = nn.Linear(hidden_size, self.in_features)
+    
+    def forward(self, x):
+        # x shape: (B, C, F, T) -> (B, 256, 32, 33)
+        b, c, f, t = x.size()
+        x_reshaped = x.permute(0, 3, 1, 2).contiguous().view(b, t, c * f) # (B, 33, 8192)
+        h = self.fc_in(x_reshaped)
+        h, _ = self.lstm(h)
+        out = self.fc_out(h)
+        out = out.view(b, t, c, f).permute(0, 2, 3, 1).contiguous() # (B, C, F, T)
+        return out + x # Conexión residual
+
+
 class TinyUNetMultiStem(nn.Module):
     def __init__(self):
         super().__init__()
@@ -64,6 +83,7 @@ class TinyUNetMultiStem(nn.Module):
         
         # Cuello de Botella
         self.bottleneck = DoubleConv(128, 256)
+        self.rnn_bottleneck = RNNBottleneck(channels=256, freq_bins=32, hidden_size=256)
         self.dropout = nn.Dropout2d(0.15)
         
         # Decoder (Expansión)
@@ -91,6 +111,7 @@ class TinyUNetMultiStem(nn.Module):
         
         # Bottleneck
         b = self.bottleneck(self.dropout(self.pool4(e4)))
+        b = self.rnn_bottleneck(b)
         b = self.dropout(b)
         
         # Decoder con Skip Connections

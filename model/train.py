@@ -101,6 +101,39 @@ def reconstruct_audio(pred_log_mag, mix_phase, n_fft=1024, hop_length=256):
     return audio.reshape(B, S, -1)
 
 
+def prepare_batch(complex_stems, true_audio, device, randomize_stems=False):
+    """
+    Realiza In-Batch Stem Randomization y prepara los tensores para la GPU.
+    """
+    complex_stems = complex_stems.to(device, non_blocking=True)
+    true_audio = true_audio.to(device, non_blocking=True)
+    
+    B, S, F, T = complex_stems.shape
+    
+    if randomize_stems and B > 1:
+        # In-Batch Stem Randomization (Frankenstein mix)
+        # S = 4: ['vocals', 'drums', 'bass', 'other']
+        # Dejamos vocals fijos y mezclamos aleatoriamente los demás
+        for i in range(1, S):
+            idx = torch.randperm(B, device=device)
+            complex_stems[:, i] = complex_stems[idx, i]
+            true_audio[:, i] = true_audio[idx, i]
+            
+    # Crear mezcla sumando los stems
+    complex_mix = torch.sum(complex_stems, dim=1, keepdim=True)
+    
+    # Separar Magnitud y Fase
+    mix_mag = torch.abs(complex_mix)
+    mix_phase = torch.angle(complex_mix)
+    y_true_mag = torch.abs(complex_stems)
+    
+    # Compresión Logarítmica
+    mix = torch.log1p(mix_mag) / 7.0
+    true_stems = torch.log1p(y_true_mag) / 7.0
+    
+    return mix, true_stems, mix_phase, true_audio
+
+
 def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5):
     logging.info(f"Entrenando en: {device}")
     logging.info(f"Archivo de log creado en: {log_filename}")
@@ -110,6 +143,14 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
 
     # Inicialización del modelo y optimizador
     model = TinyUNetMultiStem().to(device)
+    
+    if hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model)
+            logging.info("Modelo optimizado con torch.compile().")
+        except Exception as e:
+            logging.warning(f"No se pudo usar torch.compile: {e}")
+            
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     
     # Pérdida: L1 (espectrograma)
@@ -137,11 +178,10 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
         # 1. Envolvemos el dataloader con tqdm
         loop_train = tqdm(train_dataloader, desc=f"Epoch [{epoch+1}/{epochs}] Entreno", leave=False)
         
-        for batch_idx, (mix, true_stems, _, _) in enumerate(loop_train):
-            mix = mix.to(device, non_blocking=True)
-            true_stems = true_stems.to(device, non_blocking=True)
+        for batch_idx, (complex_stems, true_audio) in enumerate(loop_train):
+            mix, true_stems, mix_phase, true_audio = prepare_batch(complex_stems, true_audio, device, randomize_stems=True)
 
-            # Forward Pass con Mixed Precision (L1 + Ortho)
+            # Forward Pass con Mixed Precision (L1 + Ortho + SI-SDR Waveform)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type):
                 masks = model(mix)
@@ -149,9 +189,13 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
                 pred_stems = masks * mix_expanded
                 l1_loss = criterion_l1(pred_stems, true_stems)
                 ortho = orthogonality_loss(pred_stems)
+                
+                # SI-SDR Real en dominio temporal (entrenamiento)
+                pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
+                min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
+                si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
             
-            # Entrenamiento súper rápido solo con métricas de espectrograma
-            loss = l1_loss + 0.1 * ortho
+            loss = l1_loss + 0.5 * si_sdr + 0.1 * ortho
             
             # Backpropagation con AMP
             scaler.scale(loss).backward()
@@ -166,7 +210,7 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
             train_running_loss += loss.item()
             
             # 2. Actualizamos la barra de progreso con el loss actual
-            loop_train.set_postfix(loss=loss.item(), l1=l1_loss.item(), ortho=ortho.item())
+            loop_train.set_postfix(loss=loss.item(), l1=l1_loss.item(), sdr=si_sdr.item(), ortho=ortho.item())
 
         avg_train_loss = train_running_loss / len(train_dataloader)
         
@@ -185,11 +229,8 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
         
         # Desactivamos gradientes para la validación
         with torch.no_grad():
-            for batch_idx, (mix, true_stems, mix_phase, true_audio) in enumerate(loop_val):
-                mix = mix.to(device, non_blocking=True)
-                true_stems = true_stems.to(device, non_blocking=True)
-                mix_phase = mix_phase.to(device, non_blocking=True)
-                true_audio = true_audio.to(device, non_blocking=True)
+            for batch_idx, (complex_stems, true_audio) in enumerate(loop_val):
+                mix, true_stems, mix_phase, true_audio = prepare_batch(complex_stems, true_audio, device, randomize_stems=False)
                 
                 # Inferir máscaras y predecir con Mixed Precision
                 with torch.amp.autocast(device_type=device.type):
@@ -279,9 +320,8 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
         
         loop_train = tqdm(train_dataloader, desc=f"FT Epoch [{epoch+1}/{epochs}] Entreno", leave=False)
         
-        for batch_idx, (mix, true_stems, _, _) in enumerate(loop_train):
-            mix = mix.to(device, non_blocking=True)
-            true_stems = true_stems.to(device, non_blocking=True)
+        for batch_idx, (complex_stems, true_audio) in enumerate(loop_train):
+            mix, true_stems, mix_phase, true_audio = prepare_batch(complex_stems, true_audio, device, randomize_stems=True)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type):
@@ -289,9 +329,14 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
                 mix_expanded = mix.expand_as(masks)
                 pred_stems = masks * mix_expanded
                 l1_loss = criterion(pred_stems, true_stems)
+                
+                # SI-SDR Real en dominio temporal (entrenamiento de Fine-Tuning)
+                pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
+                min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
+                si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
             
-            # Entrenamiento rápido (solo L1)
-            loss = l1_loss
+            # Entrenamiento (L1 + SI-SDR)
+            loss = l1_loss + 0.2 * si_sdr
             
             scaler.scale(loss).backward()
             
@@ -302,7 +347,7 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
             scaler.update()
             
             train_running_loss += loss.item()
-            loop_train.set_postfix(loss=loss.item(), l1=l1_loss.item())
+            loop_train.set_postfix(loss=loss.item(), l1=l1_loss.item(), sdr=si_sdr.item())
 
         avg_train_loss = train_running_loss / len(train_dataloader)
         
@@ -318,11 +363,8 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
         loop_val = tqdm(val_dataloader, desc=f"FT Epoch [{epoch+1}/{epochs}] Valid", leave=False)
         
         with torch.no_grad():
-            for batch_idx, (mix, true_stems, mix_phase, true_audio) in enumerate(loop_val):
-                mix = mix.to(device, non_blocking=True)
-                true_stems = true_stems.to(device, non_blocking=True)
-                mix_phase = mix_phase.to(device, non_blocking=True)
-                true_audio = true_audio.to(device, non_blocking=True)
+            for batch_idx, (complex_stems, true_audio) in enumerate(loop_val):
+                mix, true_stems, mix_phase, true_audio = prepare_batch(complex_stems, true_audio, device, randomize_stems=False)
                 
                 with torch.amp.autocast(device_type=device.type):
                     masks = model(mix)

@@ -97,17 +97,6 @@ class MUSDB18RandomMixDataset(Dataset):
         complex_stems_tensor = stems_complex
         true_audio = stems_audio
         
-        # 3. Crear la mezcla sumando los stems coherentes
-        complex_mix = torch.sum(complex_stems_tensor, dim=0, keepdim=True) 
-        
-        # 4. Separar Magnitud y Fase
-        mix_mag = torch.abs(complex_mix)
-        mix_phase = torch.angle(complex_mix)
-        y_true_mag = torch.abs(complex_stems_tensor)
-        
-        # 5. Compresión Logarítmica (sin clamp para preservar rango dinámico)
-        x_mix = torch.log1p(mix_mag) / 7.0
-        
-        y_true = torch.log1p(y_true_mag) / 7.0
-        
-        return x_mix, y_true, mix_phase, true_audio
+        # Devolvemos los tensores complejos y el audio para ensamblar la mezcla
+        # en la GPU (train.py), lo que nos permite hacer In-Batch Stem Randomization.
+        return complex_stems_tensor, true_audio
