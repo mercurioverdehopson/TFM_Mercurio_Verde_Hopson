@@ -6,6 +6,7 @@ import os
 import logging
 import datetime
 
+from model.train import prepare_batch
 # Asegurar que la carpeta 'log' exista
 os.makedirs('log', exist_ok=True)
 
@@ -93,9 +94,8 @@ def test_model(model, test_loader, device):
     
     # Desactivamos el cálculo de gradientes para ahorrar memoria y CPU
     with torch.no_grad():
-        for batch_idx, (mix, true_stems, mix_phase, true_audio) in enumerate(test_loader):
-            mix = mix.to(device, non_blocking=True)
-            true_stems = true_stems.to(device, non_blocking=True)
+        for batch_idx, (complex_stems, true_audio) in enumerate(test_loader):
+            mix, true_stems, mix_phase, true_audio = prepare_batch(complex_stems, true_audio, device, randomize_stems=False)
             
             # 1. Predicción
             masks = model(mix)
