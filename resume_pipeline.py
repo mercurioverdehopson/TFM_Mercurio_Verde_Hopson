@@ -10,7 +10,6 @@ from model.export import export_and_quantize
 from model.test import test_model
 from model.pruning import apply_structural_pruning
 from model.data import MUSDB18RandomMixDataset
-from model.model import UNetD3  # Ajusta esto si tu modelo se llama de otra forma en model.py
 
 os.makedirs('log', exist_ok=True)
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
