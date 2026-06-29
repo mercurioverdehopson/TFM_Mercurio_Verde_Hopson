@@ -73,8 +73,42 @@ def si_sdr_loss(pred, target):
         torch.sum(s_target ** 2, dim=-1) / (torch.sum(e_noise ** 2, dim=-1) + 1e-8) + 1e-8
     )
     
+    
     return -si_sdr.mean()
 
+
+class MultiResolutionSTFTLoss(nn.Module):
+    def __init__(self, fft_sizes=[512, 1024, 2048], hop_sizes=[128, 256, 512], win_lengths=[512, 1024, 2048]):
+        super().__init__()
+        self.fft_sizes = fft_sizes
+        self.hop_sizes = hop_sizes
+        self.win_lengths = win_lengths
+        self.windows = {}
+
+    def forward(self, pred, target):
+        B, S, T = pred.shape
+        pred = pred.reshape(B * S, T)
+        target = target.reshape(B * S, T)
+        
+        loss = 0.0
+        for f, h, w in zip(self.fft_sizes, self.hop_sizes, self.win_lengths):
+            if f not in self.windows or self.windows[f].device != pred.device:
+                self.windows[f] = torch.hann_window(w, device=pred.device)
+            
+            p_stft = torch.stft(pred, n_fft=f, hop_length=h, win_length=w, window=self.windows[f], return_complex=True)
+            t_stft = torch.stft(target, n_fft=f, hop_length=h, win_length=w, window=self.windows[f], return_complex=True)
+            
+            p_mag = torch.abs(p_stft) + 1e-7
+            t_mag = torch.abs(t_stft) + 1e-7
+            
+            # Spectral Convergence
+            sc_loss = torch.norm(t_mag - p_mag, p="fro") / (torch.norm(t_mag, p="fro") + 1e-7)
+            # Log Magnitude
+            log_loss = F.l1_loss(torch.log(p_mag), torch.log(t_mag))
+            
+            loss += (sc_loss + log_loss)
+            
+        return loss / len(self.fft_sizes)
 
 def reconstruct_audio(pred_log_mag, mix_phase, n_fft=1024, hop_length=256):
     """
@@ -151,10 +185,14 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
         except Exception as e:
             logging.warning(f"No se pudo usar torch.compile: {e}")
             
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    if device.type == 'cuda':
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4, fused=True)
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     
-    # Pérdida: L1 (espectrograma)
+    # Pérdida: L1, MR-STFT
     criterion_l1 = nn.L1Loss()
+    criterion_mrstft = MultiResolutionSTFTLoss().to(device)
 
     # Variables para el control de Early Stopping
     best_val_loss = float('inf')
@@ -162,9 +200,9 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
     best_model_path = "best_model_checkpoint.pt"
     torch.save(model.state_dict(), best_model_path)
 
-    # Inicialización de Mixed Precision (AMP) y Scheduler (Cosine Annealing)
+    # Inicialización de Mixed Precision (AMP) y Scheduler (Cosine Annealing Warm Restarts)
     scaler = torch.amp.GradScaler(device=device)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=2, eta_min=1e-6)
 
     # Bucle de Epochs
     for epoch in range(epochs):
@@ -194,8 +232,9 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
                 pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
                 min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
                 si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
+                mr_stft = criterion_mrstft(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
             
-            loss = l1_loss + 0.5 * si_sdr + 0.1 * ortho
+            loss = l1_loss + 0.5 * si_sdr + 0.1 * ortho + 0.5 * mr_stft
             
             # Backpropagation con AMP
             scaler.scale(loss).backward()
@@ -244,8 +283,9 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
                 pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
                 min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
                 si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
+                mr_stft = criterion_mrstft(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
                 
-                loss = l1_loss + 0.5 * si_sdr + 0.1 * ortho
+                loss = l1_loss + 0.5 * si_sdr + 0.1 * ortho + 0.5 * mr_stft
                 val_running_loss += loss.item()
                 
                 # 2. Actualizamos la barra de progreso

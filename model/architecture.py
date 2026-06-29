@@ -25,10 +25,14 @@ class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            # Depthwise Separable Conv 1
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels, bias=False),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            # Depthwise Separable Conv 2
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels, bias=False),
+            nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels)
         )
         self.se = SEBlock(out_channels)
@@ -72,35 +76,35 @@ class TinyUNetMultiStem(nn.Module):
         super().__init__()
         
         # Encoder (Contracción)
-        self.enc1 = DoubleConv(1, 16)
+        self.enc1 = DoubleConv(1, 32)
         self.pool1 = nn.MaxPool2d(2)
-        self.enc2 = DoubleConv(16, 32)
+        self.enc2 = DoubleConv(32, 64)
         self.pool2 = nn.MaxPool2d(2)
-        self.enc3 = DoubleConv(32, 64)
+        self.enc3 = DoubleConv(64, 128)
         self.pool3 = nn.MaxPool2d(2)
-        self.enc4 = DoubleConv(64, 128)
+        self.enc4 = DoubleConv(128, 256)
         self.pool4 = nn.MaxPool2d(2)
         
         # Cuello de Botella
-        self.bottleneck = DoubleConv(128, 256)
-        self.rnn_bottleneck = RNNBottleneck(channels=256, freq_bins=32, hidden_size=256)
+        self.bottleneck = DoubleConv(256, 512)
+        self.rnn_bottleneck = RNNBottleneck(channels=512, freq_bins=32, hidden_size=256)
         self.dropout = nn.Dropout2d(0.15)
         
         # Decoder (Expansión)
-        self.upconv4 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.dec4 = DoubleConv(256, 128) # 128 (upconv) + 128 (skip)
+        self.upconv4 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.dec4 = DoubleConv(512, 256) # 256 (upconv) + 256 (skip)
         
-        self.upconv3 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.dec3 = DoubleConv(128, 64)
+        self.upconv3 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.dec3 = DoubleConv(256, 128)
         
-        self.upconv2 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
-        self.dec2 = DoubleConv(64, 32)
+        self.upconv2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.dec2 = DoubleConv(128, 64)
         
-        self.upconv1 = nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2)
-        self.dec1 = DoubleConv(32, 16)
+        self.upconv1 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.dec1 = DoubleConv(64, 32)
         
         # Capa de Salida: 4 canales (Voces, Batería, Bajo, Otros)
-        self.out_conv = nn.Conv2d(16, 4, kernel_size=1)
+        self.out_conv = nn.Conv2d(32, 4, kernel_size=1)
 
     def forward(self, x):
         # Encoder

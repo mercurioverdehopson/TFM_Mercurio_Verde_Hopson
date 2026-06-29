@@ -42,6 +42,12 @@ class MUSDB18RandomMixDataset(Dataset):
             gain = random.uniform(0.3, 2.0)
             resampled_audio = resampled_audio * gain
             
+            # Pitch Shifting (±2 semitonos)
+            n_steps = random.randint(-2, 2)
+            if n_steps != 0:
+                pitch_shift = T.PitchShift(self.target_sr, n_steps=n_steps)
+                resampled_audio = pitch_shift(resampled_audio)
+            
         # 2. STFT (Tensor complejo)
         complex_spec = self.stft(resampled_audio) 
         complex_spec = complex_spec[:, :-1, :] # Descartar Nyquist (512 bandas)
