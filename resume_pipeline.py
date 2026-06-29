@@ -61,8 +61,10 @@ if __name__ == "__main__":
     from model.architecture import TinyUNetMultiStem
     trained_model = TinyUNetMultiStem().to(device)
     
-    # Cargar pesos
-    trained_model.load_state_dict(torch.load("modelo_pre_poda.pt", map_location=device))
+    # Cargar pesos (Eliminamos '_orig_mod.' por si fue guardado con torch.compile)
+    state_dict = torch.load("modelo_pre_poda.pt", map_location=device)
+    state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+    trained_model.load_state_dict(state_dict)
     
     logging.info("--- Evaluación Pre-Poda (BSS EVAL) ---")
     test_model(trained_model, test_loader, device=device)
