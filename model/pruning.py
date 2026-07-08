@@ -2,45 +2,47 @@ import torch.nn as nn
 import torch.nn.utils.prune as prune
 import os
 import logging
-import datetime
 from model.architecture import TinyUNetMultiStem
 
-# Asegurar que la carpeta 'log' exista
-os.makedirs('log', exist_ok=True)
-
-# Generar el nombre del archivo basado en el timestamp actual
-timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-log_filename = os.path.join('log', f"pruning_{timestamp}.log")
-
-# Configuración del logger para escribir en el archivo con timestamp y mostrar en consola
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_filename),
-        logging.StreamHandler()
-    ]
-)
+logger = logging.getLogger(__name__)
 
 def apply_structural_pruning(model, pruning_amount=0.2):
     """
     Aplica poda estructural orientada a canales (L1-norm) en las capas convolucionales
     del codificador y decodificador según lo especificado en la metodología del TFM.
+    
+    Nota: Se saltan las convoluciones depthwise (groups > 1) porque podar sus canales
+    sin ajustar coherentemente las pointwise asociadas crearía inconsistencias dimensionales.
+    También se salta la capa de salida para no alterar los 4 canales de stems musicales,
+    y capas con pocos canales (< 8) para no eliminar demasiada capacidad.
     """
-    logging.info(f"Iniciando el pipeline de poda estructural (Cantidad: {pruning_amount * 100}%)")
-    logging.info(f"Archivo de log creado en: {log_filename}")
+    logger.info(f"Iniciando el pipeline de poda estructural (Cantidad: {pruning_amount * 100}%)")
     
     pruned_layers_count = 0
+    skipped_layers = []
     
     # Recorrer todos los módulos para buscar capas convolucionales de los bloques DoubleConv
     for name, module in model.named_modules():
         if isinstance(module, nn.Conv2d):
             # No podamos la capa de salida final para no alterar los 4 canales de stems musicales
-            if name == "out_conv":
-                logging.info(f"Saltando capa de salida: {name}")
+            if 'out_conv' in name:
+                skipped_layers.append((name, "capa de salida"))
+                continue
+            
+            # No podamos convoluciones depthwise (groups > 1)
+            # En Depthwise Separable Convolutions, cada canal de salida del depthwise
+            # depende de un solo canal de entrada. Podarlos sin ajustar las pointwise
+            # asociadas crearía inconsistencias dimensionales silenciosas.
+            if module.groups > 1:
+                skipped_layers.append((name, f"depthwise (groups={module.groups})"))
+                continue
+            
+            # No podamos capas con muy pocos canales para preservar capacidad mínima
+            if module.out_channels < 8:
+                skipped_layers.append((name, f"pocos canales ({module.out_channels})"))
                 continue
                 
-            logging.info(f"Aplicando poda estructural L1 en los canales de la capa: {name}")
+            logger.info(f"Aplicando poda estructural L1 en los canales de la capa: {name}")
             
             # Poda estructural orientada a canales basada en la norma L1 (dim=0 es el canal de salida)
             prune.ln_structured(
@@ -55,11 +57,15 @@ def apply_structural_pruning(model, pruning_amount=0.2):
             prune.remove(module, "weight")
             pruned_layers_count += 1
 
-    logging.info(f"Poda estructural completada con éxito. Se han podado {pruned_layers_count} capas convolucionales.")
+    # Registrar capas saltadas para trazabilidad
+    for name, reason in skipped_layers:
+        logger.info(f"Saltando capa: {name} ({reason})")
+    
+    logger.info(f"Poda estructural completada con éxito. Se han podado {pruned_layers_count} capas convolucionales.")
     return model
 
 if __name__ == "__main__":
     # Ejemplo de inicialización y prueba del script de poda
     model = TinyUNetMultiStem()
-    logging.info("Modelo base cargado para el test de poda.")
+    logger.info("Modelo base cargado para el test de poda.")
     pruned_model = apply_structural_pruning(model, pruning_amount=0.2)

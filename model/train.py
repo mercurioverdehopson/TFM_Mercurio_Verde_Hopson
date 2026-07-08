@@ -5,26 +5,10 @@ import torch.optim as optim
 import torchaudio.transforms as T
 import os
 import logging
-import datetime
 from tqdm import tqdm
 from model.architecture import TinyUNetMultiStem
 
-# Asegurar que la carpeta 'log' exista
-os.makedirs('log', exist_ok=True)
-
-# Generar el nombre del archivo basado en el timestamp actual
-timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-log_filename = os.path.join('log', f"training_{timestamp}.log")
-
-# Configuración del logger para escribir en el archivo con timestamp y mostrar en consola
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_filename),
-        logging.StreamHandler()
-    ]
-)
+logger = logging.getLogger(__name__)
 
 def orthogonality_loss(pred_stems):
     """
@@ -169,8 +153,7 @@ def prepare_batch(complex_stems, true_audio, device, randomize_stems=False):
 
 
 def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5):
-    logging.info(f"Entrenando en: {device}")
-    logging.info(f"Archivo de log creado en: {log_filename}")
+    logger.info(f"Entrenando en: {device}")
 
     # Hiperparámetros
     learning_rate = 0.001
@@ -181,16 +164,16 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
     if hasattr(torch, 'compile'):
         try:
             model = torch.compile(model)
-            logging.info("Modelo optimizado con torch.compile().")
+            logger.info("Modelo optimizado con torch.compile().")
         except Exception as e:
-            logging.warning(f"No se pudo usar torch.compile: {e}")
+            logger.warning(f"No se pudo usar torch.compile: {e}")
             
     if device.type == 'cuda':
         optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4, fused=True)
     else:
         optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     
-    # Pérdida: L1, MR-STFT
+    # Pérdida: L1, MR-STFT (peso reducido, fuera de autocast)
     criterion_l1 = nn.L1Loss()
     criterion_mrstft = MultiResolutionSTFTLoss().to(device)
 
@@ -200,9 +183,11 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
     best_model_path = "best_model_checkpoint.pt"
     torch.save(model.state_dict(), best_model_path)
 
-    # Inicialización de Mixed Precision (AMP) y Scheduler (Cosine Annealing Warm Restarts)
+    # Mixed Precision (AMP) y Scheduler (Cosine Annealing sin restarts)
     scaler = torch.amp.GradScaler(device=device)
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=2, eta_min=1e-6)
+    # CosineAnnealingLR: decaimiento monótono del LR evita que warm restarts
+    # disparen el early stopping al subir la loss abruptamente.
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     # Bucle de Epochs
     for epoch in range(epochs):
@@ -219,7 +204,7 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
         for batch_idx, (complex_stems, true_audio) in enumerate(loop_train):
             mix, true_stems, mix_phase, true_audio = prepare_batch(complex_stems, true_audio, device, randomize_stems=True)
 
-            # Forward Pass con Mixed Precision (L1 + Ortho + SI-SDR Waveform)
+            # Forward Pass con Mixed Precision (solo L1 + Ortho — seguros en FP16)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type):
                 masks = model(mix)
@@ -227,14 +212,15 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
                 pred_stems = masks * mix_expanded
                 l1_loss = criterion_l1(pred_stems, true_stems)
                 ortho = orthogonality_loss(pred_stems)
-                
-                # SI-SDR Real en dominio temporal (entrenamiento)
-                pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
-                min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
-                si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
-                mr_stft = criterion_mrstft(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
             
-            loss = l1_loss + 0.5 * si_sdr + 0.1 * ortho + 0.5 * mr_stft
+            # SI-SDR y MR-STFT fuera de autocast (FP32) para estabilidad numérica
+            # con operaciones complejas (exp, log, istft, stft)
+            pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
+            min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
+            si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
+            mr_stft = criterion_mrstft(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
+            
+            loss = l1_loss + 0.5 * si_sdr + 0.1 * ortho + 0.1 * mr_stft
             
             # Backpropagation con AMP
             scaler.scale(loss).backward()
@@ -279,13 +265,13 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
                     l1_loss = criterion_l1(pred_stems, true_stems)
                     ortho = orthogonality_loss(pred_stems)
                 
-                # SI-SDR Real en dominio temporal (rápido por estar en torch.no_grad)
+                # SI-SDR y MR-STFT fuera de autocast (FP32)
                 pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
                 min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
                 si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
                 mr_stft = criterion_mrstft(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
                 
-                loss = l1_loss + 0.5 * si_sdr + 0.1 * ortho + 0.5 * mr_stft
+                loss = l1_loss + 0.5 * si_sdr + 0.1 * ortho + 0.1 * mr_stft
                 val_running_loss += loss.item()
                 
                 # 2. Actualizamos la barra de progreso
@@ -293,7 +279,7 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
                 
         avg_val_loss = val_running_loss / len(val_dataloader)
 
-        logging.info(f"Epoch [{epoch+1}/{epochs}] - Loss Total Entreno: {avg_train_loss:.4f} | Loss Total Validación: {avg_val_loss:.4f}")
+        logger.info(f"Epoch [{epoch+1}/{epochs}] - Loss Total Entreno: {avg_train_loss:.4f} | Loss Total Validación: {avg_val_loss:.4f}")
         
         # Actualizar el Scheduler (Cosine Annealing)
         scheduler.step()
@@ -306,18 +292,18 @@ def train_model(train_dataloader, val_dataloader, device, epochs=50, patience=5)
             best_val_loss = avg_val_loss
             epochs_no_improve = 0
             torch.save(model.state_dict(), best_model_path)
-            logging.info("Mejora detectada. Guardando estado del modelo...")
+            logger.info("Mejora detectada. Guardando estado del modelo...")
         else:
             # Si no hay mejora, aumentamos el contador
             epochs_no_improve += 1
-            logging.info(f"Sin mejora ({epochs_no_improve}/{patience}).")
+            logger.info(f"Sin mejora ({epochs_no_improve}/{patience}).")
             
             # Si agotamos la paciencia, detenemos el bucle
             if epochs_no_improve >= patience:
-                logging.warning(f"EARLY STOPPING ACTIVADO en la epoch {epoch+1}.")
+                logger.warning(f"EARLY STOPPING ACTIVADO en la epoch {epoch+1}.")
                 break
 
-    logging.info("Entrenamiento finalizado.")
+    logger.info("Entrenamiento finalizado.")
     
     # Restauramos siempre los mejores pesos antes de devolver el modelo
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
@@ -331,8 +317,8 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
     reducido para recuperar la calidad perdida durante la poda estructural.
     A diferencia de train_model, NO crea un modelo nuevo, sino que recibe uno existente.
     """
-    logging.info(f"Iniciando Fine-Tuning post-poda en: {device}")
-    logging.info(f"Epochs: {epochs} | Patience: {patience}")
+    logger.info(f"Iniciando Fine-Tuning post-poda en: {device}")
+    logger.info(f"Epochs: {epochs} | Patience: {patience}")
 
     # Learning rate reducido (10x menor que el entrenamiento original)
     # para ajustes finos sin destruir lo aprendido
@@ -363,19 +349,20 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
         for batch_idx, (complex_stems, true_audio) in enumerate(loop_train):
             mix, true_stems, mix_phase, true_audio = prepare_batch(complex_stems, true_audio, device, randomize_stems=True)
 
+            # Forward Pass con Mixed Precision (solo L1 — seguro en FP16)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type):
                 masks = model(mix)
                 mix_expanded = mix.expand_as(masks)
                 pred_stems = masks * mix_expanded
                 l1_loss = criterion(pred_stems, true_stems)
-                
-                # SI-SDR Real en dominio temporal (entrenamiento de Fine-Tuning)
-                pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
-                min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
-                si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
             
-            # Entrenamiento (L1 + SI-SDR)
+            # SI-SDR fuera de autocast (FP32) para estabilidad numérica
+            pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
+            min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
+            si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
+            
+            # Fine-Tuning (L1 + SI-SDR)
             loss = l1_loss + 0.2 * si_sdr
             
             scaler.scale(loss).backward()
@@ -406,13 +393,14 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
             for batch_idx, (complex_stems, true_audio) in enumerate(loop_val):
                 mix, true_stems, mix_phase, true_audio = prepare_batch(complex_stems, true_audio, device, randomize_stems=False)
                 
+                # Inferir con Mixed Precision (solo L1 — seguro en FP16)
                 with torch.amp.autocast(device_type=device.type):
                     masks = model(mix)
                     mix_expanded = mix.expand_as(masks)
                     pred_stems = masks * mix_expanded
                     l1_loss = criterion(pred_stems, true_stems)
                 
-                # SI-SDR Real temporal solo en validación
+                # SI-SDR fuera de autocast (FP32)
                 pred_audio = reconstruct_audio(pred_stems.float(), mix_phase.float())
                 min_len = min(pred_audio.shape[-1], true_audio.shape[-1])
                 si_sdr = si_sdr_loss(pred_audio[:, :, :min_len], true_audio[:, :, :min_len])
@@ -423,7 +411,7 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
                 
         avg_val_loss = val_running_loss / len(val_dataloader)
 
-        logging.info(f"FT Epoch [{epoch+1}/{epochs}] - Loss Total Entreno: {avg_train_loss:.4f} | Loss Total Validación: {avg_val_loss:.4f}")
+        logger.info(f"FT Epoch [{epoch+1}/{epochs}] - Loss Total Entreno: {avg_train_loss:.4f} | Loss Total Validación: {avg_val_loss:.4f}")
         
         scheduler.step(avg_val_loss)
 
@@ -434,16 +422,16 @@ def finetune_model(model, train_dataloader, val_dataloader, device, epochs=10, p
             best_val_loss = avg_val_loss
             epochs_no_improve = 0
             torch.save(model.state_dict(), best_model_path)
-            logging.info("FT: Mejora detectada. Guardando estado del modelo...")
+            logger.info("FT: Mejora detectada. Guardando estado del modelo...")
         else:
             epochs_no_improve += 1
-            logging.info(f"FT: Sin mejora ({epochs_no_improve}/{patience}).")
+            logger.info(f"FT: Sin mejora ({epochs_no_improve}/{patience}).")
             
             if epochs_no_improve >= patience:
-                logging.warning(f"FT: EARLY STOPPING ACTIVADO en la epoch {epoch+1}.")
+                logger.warning(f"FT: EARLY STOPPING ACTIVADO en la epoch {epoch+1}.")
                 break
 
-    logging.info("Fine-Tuning post-poda finalizado.")
+    logger.info("Fine-Tuning post-poda finalizado.")
     
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
     

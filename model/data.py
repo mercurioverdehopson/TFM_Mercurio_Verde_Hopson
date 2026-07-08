@@ -4,13 +4,67 @@ import torchaudio.transforms as T
 from torch.utils.data import Dataset
 import musdb
 import random
+import logging
+
+logger = logging.getLogger(__name__)
+
+def create_leave_p_out_splits(root_dir, p=15, seed=42):
+    """
+    Crea los índices para Leave-P-Out a partir del split 'train' de MUSDB18.
+    
+    MUSDB18 tiene 100 pistas en 'train' y 50 en 'test'.
+    Se reservan P pistas del train como validación, dejando el resto para entrenamiento.
+    Los 50 tracks de 'test' quedan intactos como evaluación final independiente.
+    
+    Args:
+        root_dir: Ruta al dataset MUSDB18
+        p: Número de pistas a reservar para validación (default: 15 → 85 train / 15 val)
+        seed: Semilla para reproducibilidad
+    
+    Returns:
+        train_indices: Lista de índices para entrenamiento
+        val_indices: Lista de índices para validación
+    """
+    mus = musdb.DB(root=root_dir, subsets='train', is_wav=True)
+    n_tracks = len(mus.tracks)
+    
+    rng = random.Random(seed)
+    all_indices = list(range(n_tracks))
+    rng.shuffle(all_indices)
+    
+    val_indices = sorted(all_indices[:p])
+    train_indices = sorted(all_indices[p:])
+    
+    logger.info(f"Leave-{p}-Out: {len(train_indices)} pistas train, {len(val_indices)} pistas val (de {n_tracks} totales)")
+    logger.info(f"Índices de validación: {val_indices}")
+    
+    return train_indices, val_indices
+
 
 class MUSDB18RandomMixDataset(Dataset):
-    def __init__(self, root_dir, split='train', samples_per_epoch=2000):
-        self.mus = musdb.DB(root=root_dir, subsets=split, is_wav=True)
-        self.split = split  # NUEVO: Guardamos la fase para saber cuándo aplicar augmentations
+    def __init__(self, root_dir, subset='train', is_training=True, 
+                 samples_per_epoch=2000, track_indices=None):
+        """
+        Dataset para separación de fuentes musicales con MUSDB18.
+        
+        Args:
+            root_dir: Ruta al dataset MUSDB18
+            subset: 'train' o 'test' — qué subset de MUSDB18 cargar
+            is_training: True → augmentation + chunks aleatorios; False → determinista sin augmentation
+            samples_per_epoch: Número de muestras por epoch
+            track_indices: Lista de índices de pistas a usar (para Leave-P-Out).
+                          Si es None, usa todas las pistas del subset.
+        """
+        self.mus = musdb.DB(root=root_dir, subsets=subset, is_wav=True)
+        self.is_training = is_training
         self.samples_per_epoch = samples_per_epoch
         self.instruments = ['vocals', 'drums', 'bass', 'other']
+        
+        # Seleccionar pistas específicas si se proporcionan índices (Leave-P-Out)
+        if track_indices is not None:
+            self.tracks = [self.mus.tracks[i] for i in track_indices]
+        else:
+            self.tracks = self.mus.tracks
         
         self.orig_sr = 44100
         self.target_sr = 22050
@@ -36,8 +90,8 @@ class MUSDB18RandomMixDataset(Dataset):
         mono_audio = torch.mean(audio_tensor, dim=0, keepdim=True)
         resampled_audio = self.resample(mono_audio)
         
-        # --- DATA AUGMENTATION (Fase Train) ---
-        if self.split == 'train':
+        # --- DATA AUGMENTATION (solo en entrenamiento) ---
+        if self.is_training:
             # Variación de ganancia estocástica
             gain = random.uniform(0.3, 2.0)
             resampled_audio = resampled_audio * gain
@@ -71,16 +125,16 @@ class MUSDB18RandomMixDataset(Dataset):
         stems_audio = torch.empty(4, self.time_frames * self.hop_length)
         
         # 1. Seleccionar UNA canción y UN punto temporal para todos los stems (mezcla coherente)
-        if self.split == 'test':
-            # Generador determinista para validación. Garantiza que el batch 'idx'
+        if not self.is_training:
+            # Generador determinista para validación/test. Garantiza que el batch 'idx'
             # SIEMPRE devuelve el mismo fragmento de audio en todos los epochs.
             rng = random.Random(idx + 42)
-            track = rng.choice(self.mus.tracks)
+            track = rng.choice(self.tracks)
             max_start = max(0, track.duration - self.chunk_duration)
             start_time = rng.uniform(0, max_start)
         else:
             # Aleatoriedad total para el entrenamiento
-            track = random.choice(self.mus.tracks)
+            track = random.choice(self.tracks)
             max_start = max(0, track.duration - self.chunk_duration)
             start_time = random.uniform(0, max_start)
         
@@ -99,7 +153,7 @@ class MUSDB18RandomMixDataset(Dataset):
             stems_audio[i] = audio_wave[0]
             
         # 2. Agrupar stems
-        # Shape resultante: (4, 512, 352)
+        # Shape resultante: (4, 512, 528)
         complex_stems_tensor = stems_complex
         true_audio = stems_audio
         
