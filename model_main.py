@@ -79,7 +79,7 @@ if __name__ == "__main__":
         train_dataloader=train_loader, 
         val_dataloader=val_loader, 
         device=device, 
-        epochs=1,     # Más epochs con scheduler más suave para convergencia real
+        epochs=150,     # Más epochs con scheduler más suave para convergencia real
         patience=15     # Más paciencia acorde al scheduler menos agresivo
     )
     
